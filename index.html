@@ -155,22 +155,22 @@ thead th{font-size:11px;font-weight:500;color:#888;text-transform:uppercase;lett
 .act-btn.reopen{color:#bbb;border-color:#ddd}
 
 /* ── Phase rail ───────────────────────────────────────────────────────────── */
-.phase-rail{display:flex;gap:6px;margin-bottom:1.25rem;overflow-x:auto;max-width:60%}
-.rail-item{flex:none;min-width:50px;padding:6px 7px;border:0.5px solid #ddd;border-radius:4px;background:#fff;cursor:pointer;transition:background .1s}
+.phase-rail{display:flex;gap:6px;margin-bottom:1.25rem;max-width:60%}
+.rail-item{flex:1;min-width:0;padding:6px 7px;border:0.5px solid #ddd;border-radius:4px;background:#fff;cursor:pointer;transition:background .1s}
 .rail-item:hover:not(.active){background:#f5f5f5}
 .rail-item.active{background:#1a1a1a;color:#fff;border-color:#1a1a1a}
 .rail-name{font-size:11px;font-weight:500;margin-bottom:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.rail-dates{display:flex;align-items:center;gap:3px}
-.rail-date-inp{font-size:9px;border:none;border-bottom:0.5px solid transparent;background:transparent;padding:0;cursor:pointer;width:72px;outline:none;color:#bbb}
+.rail-dates{display:flex;align-items:center;gap:3px;width:100%}
+.rail-date-inp{font-size:9px;border:none;border-bottom:0.5px solid transparent;background:transparent;padding:0;cursor:pointer;width:0;flex:1;min-width:0;outline:none;color:#bbb}
 .rail-date-inp:hover,.rail-date-inp:focus{border-bottom-color:#ccc;color:#1a1a1a}
 .rail-item.active .rail-date-inp{color:#666;color-scheme:dark}
 .rail-item.active .rail-date-inp:hover,.rail-item.active .rail-date-inp:focus{color:#ddd;border-bottom-color:#555}
 .rail-sep{font-size:10px;color:#ccc;flex-shrink:0}
 .rail-item.active .rail-sep{color:#555}
 @media(max-width:768px){
-  .rail-item{min-width:40px;padding:1px 3px}
+  .rail-item{padding:1px 3px}
   .rail-name{font-size:10px}
-  .rail-date-inp{font-size:8px;width:56px}
+  .rail-date-inp{font-size:8px}
 }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -223,6 +223,8 @@ thead th{font-size:11px;font-weight:500;color:#888;text-transform:uppercase;lett
 <script>
 const COLORS=['#1D9E75','#378ADD','#D4537E','#BA7517','#7F77DD','#D85A30','#639922','#888780'];
 const LS_KEY='os_projects_data';
+const LS_SCROLL_KEY='os_projects_scroll';
+const LS_PHASE_KEY='os_projects_phase';
 const SUPABASE_URL='https://dzksworkkpbnghsxqskk.supabase.co';
 const SUPABASE_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR6a3N3b3Jra3Bibmdoc3hxc2trIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzcxMzEwMjYsImV4cCI6MjA5MjcwNzAyNn0.19b41BwAewSsUCQcxOU1JVqT_b76b0ZrS9-EtccmAIw';
 const sb=supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
@@ -1212,7 +1214,9 @@ function toggleConcludeSubject(tid,sid){
   showPopover({target:document.body},tid,sid);
 }
 
-function setPhase(p){currentPhase=p;closePopover();renderTabs();renderTable();renderColNumbers();}
+function saveCurrentPhase(){try{localStorage.setItem(LS_PHASE_KEY,currentPhase);}catch(e){}}
+window.saveCurrentPhase=saveCurrentPhase;
+function setPhase(p){currentPhase=p;saveCurrentPhase();closePopover();renderTabs();renderTable();renderColNumbers();}
 
 // ── Re-open phase ────────────────────────────────────────────────────────────
 
@@ -1236,6 +1240,7 @@ function deletePhase(){
   // switch to adjacent phase: prefer previous, fall back to next
   const remaining=Object.keys(phases);
   currentPhase=remaining[Math.min(idx,remaining.length-1)];
+  saveCurrentPhase();
   saveData();
   renderTabs();
   renderTable();
@@ -1629,6 +1634,7 @@ function executeWizard(){
   phases=result.phases;
   closeWizard();
   currentPhase=newKey;
+  saveCurrentPhase();
   saveData();
   renderTabs();
   renderTable();
@@ -1638,6 +1644,12 @@ function executeWizard(){
 // ────────────────────────────────────────────────────────────────────────────
 
 window.addEventListener('resize',()=>requestAnimationFrame(applyOverflow));
+
+function saveScrollPos(){try{localStorage.setItem(LS_SCROLL_KEY,window.scrollY);}catch(e){}}
+function restoreScrollPos(){const y=+localStorage.getItem(LS_SCROLL_KEY)||0;if(y)window.scrollTo(0,y);}
+window.saveScrollPos=saveScrollPos;
+window.restoreScrollPos=restoreScrollPos;
+window.addEventListener('scroll',saveScrollPos,{passive:true});
 
 (async()=>{
   const ind=document.getElementById('save-indicator');
@@ -1653,9 +1665,12 @@ window.addEventListener('resize',()=>requestAnimationFrame(applyOverflow));
   }
   clearTimeout(ind._t);
   ind._t=setTimeout(()=>{ind.style.opacity='0';},1500);
+  const savedPhase=localStorage.getItem(LS_PHASE_KEY);
+  if(savedPhase&&phases[savedPhase]) currentPhase=savedPhase;
   renderTabs();
   renderTable();
   renderColNumbers();
+  requestAnimationFrame(()=>requestAnimationFrame(restoreScrollPos));
 })();
 </script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
