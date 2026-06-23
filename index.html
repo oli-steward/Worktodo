@@ -172,6 +172,44 @@ thead th{font-size:11px;font-weight:500;color:#888;text-transform:uppercase;lett
   .rail-name{font-size:10px}
   .rail-date-inp{font-size:8px}
 }
+
+/* ── Phase goal banner ────────────────────────────────────────────────────── */
+.phase-goal-banner{margin-bottom:1.25rem}
+.pgb-header{font-size:10px;font-weight:500;color:#aaa;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+.pgb-inner{display:flex;flex-direction:column;gap:4px}
+.pgb-topic-row{display:flex;align-items:flex-start;gap:6px}
+.pgb-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;margin-top:3px}
+.pgb-name{font-size:12px;font-weight:500;min-width:90px;flex-shrink:0;color:#1a1a1a;line-height:1.5}
+.pgb-goals-wrap{display:flex;gap:4px;flex-wrap:wrap}
+.pgb-goal{font-size:11px;padding:1px 7px;border-radius:4px;background:#f5f5f5;color:#555}
+.pgb-no-goal{font-size:11px;color:#ccc;line-height:1.5}
+.pgb-toggle{font-size:11px;color:#aaa;cursor:pointer;padding:3px 0;margin-top:1px;align-self:flex-start}
+.pgb-toggle:hover{color:#1a1a1a}
+.pgb-drag-handle{color:#ccc;font-size:9px;cursor:grab;user-select:none;flex-shrink:0;line-height:1.5;margin-right:2px}
+.pgb-drag-handle:active{cursor:grabbing}
+.pgb-topic-row.pgb-dragging{opacity:0.4}
+.pgb-topic-row.pgb-drop-before{box-shadow:inset 0 2px 0 #378ADD}
+.pgb-topic-row.pgb-drop-after{box-shadow:inset 0 -2px 0 #378ADD}
+.pgb-goal-input{font-size:11px;padding:1px 7px;border-radius:4px;border:0.5px solid #e0e0e0;background:#f9f9f9;color:#333;outline:none;width:180px;transition:border-color .15s,background .15s}
+.pgb-goal-input:focus{border-color:#aaa;background:#fff}
+.pgb-goal-input::placeholder{color:#ccc}
+.pgb-hide-btn{flex-shrink:0;font-size:10px;color:#ccc;cursor:pointer;padding:1px 4px;border-radius:4px;border:none;background:transparent;line-height:1.5;margin-right:4px}
+.pgb-hide-btn:hover{color:#c0392b;background:#fdf0f0}
+.pgb-header{cursor:pointer;display:flex;align-items:center;gap:5px;user-select:none}
+.pgb-header:hover{color:#1a1a1a}
+.pgb-header-arrow{font-size:9px;color:#bbb;transition:transform .15s}
+.pgb-header-arrow.open{transform:rotate(180deg)}
+.pgb-header-summary{font-size:10px;color:#bbb;font-weight:400;text-transform:none;letter-spacing:0;margin-left:2px}
+.pgb-show-hidden{font-size:11px;color:#bbb;cursor:pointer;padding:2px 0;margin-top:2px}
+.pgb-show-hidden:hover{color:#1a1a1a}
+.pgb-hidden-row{display:flex;align-items:center;gap:6px;padding:2px 0;opacity:0.5}
+.pgb-unhide-btn{font-size:10px;padding:1px 5px;border-radius:4px;border:0.5px solid #ddd;background:transparent;color:#888;cursor:pointer}
+.pgb-unhide-btn:hover{background:#f5f5f5;color:#1a1a1a}
+@media(max-width:768px){
+  .pgb-name{min-width:70px;font-size:11px}
+  .pgb-goal{font-size:10px;padding:1px 5px}
+  .pgb-toggle{font-size:10px}
+}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
@@ -197,6 +235,7 @@ thead th{font-size:11px;font-weight:500;color:#888;text-transform:uppercase;lett
     <span class="export-toast" id="export-toast" style="opacity:0">Downloaded!</span>
   </div>
   <div class="phase-rail" id="phase-rail"></div>
+  <div class="phase-goal-banner" id="phase-goal-banner"></div>
   <div class="metrics" id="metrics"></div>
   <table>
     <thead>
@@ -395,6 +434,261 @@ function fmtMonth(ym){
   return (months[m-1]||ym)+' '+parts[0];
 }
 window.fmtMonth=fmtMonth;
+
+/**
+ * Phase Goal Banner
+ * ─────────────────
+ * Renders a ranked list of topics + their subject goals for the active phase,
+ * placed between the phase rail and the metrics row.
+ *
+ * Ranking:
+ *  - Order stored in phases[phaseKey].goalBannerOrder (array of topic IDs).
+ *  - Independent from main table order; dragging here does not affect the table.
+ *  - getOrderedBannerTopics(ph) returns topics sorted by goalBannerOrder,
+ *    appending any not yet in the list at the end.
+ *
+ * Visibility:
+ *  - GOAL_LIMIT (3) topics shown by default.
+ *  - toggleAllGoals() reveals/hides the rest.
+ *  - showAllGoals resets to false on setPhase().
+ *
+ * Data: goals live on subject.goal (string). Topics with no non-empty goals
+ *       display "—". Archived topics are excluded.
+ *
+ * Migration: no data changes to existing records — goalBannerOrder is additive.
+ */
+const GOAL_LIMIT = 3;
+let showAllGoals = false;
+let _pgbDragTopicId = null;
+
+/** Pure — returns topics sorted by ph.goalBannerOrder, unknowns appended. */
+function getOrderedBannerTopics(ph) {
+  const topics = (ph.topics || []).filter(t => !t.archived);
+  const order = ph.goalBannerOrder || [];
+  const seen = new Set();
+  const ordered = [];
+  order.forEach(id => {
+    const t = topics.find(x => x.id === id);
+    if (t && !seen.has(id)) { ordered.push(t); seen.add(id); }
+  });
+  topics.forEach(t => { if (!seen.has(t.id)) ordered.push(t); });
+  return ordered;
+}
+window.getOrderedBannerTopics = getOrderedBannerTopics;
+
+let _showHidden = false;
+let _bannerExpanded = false;
+
+function _pgbSaveGoal(topicId, value) {
+  if (!phases[currentPhase].bannerGoals) phases[currentPhase].bannerGoals = {};
+  phases[currentPhase].bannerGoals[topicId] = value;
+  saveData();
+}
+
+function _pgbHide(topicId) {
+  const ph = phases[currentPhase];
+  if (!ph.bannerHidden) ph.bannerHidden = [];
+  if (!ph.bannerHidden.includes(topicId)) ph.bannerHidden.push(topicId);
+  saveData();
+  renderGoalBanner();
+}
+
+function _pgbUnhide(topicId) {
+  const ph = phases[currentPhase];
+  ph.bannerHidden = (ph.bannerHidden || []).filter(id => id !== topicId);
+  saveData();
+  renderGoalBanner();
+}
+
+function renderGoalBanner() {
+  const banner = document.getElementById('phase-goal-banner');
+  if (!banner) return;
+  const ph = phases[currentPhase];
+  if (!ph) { banner.innerHTML = ''; return; }
+
+  const hidden = ph.bannerHidden || [];
+  const goals  = ph.bannerGoals  || {};
+  const allOrdered = getOrderedBannerTopics(ph);
+  const visible = allOrdered.filter(t => !hidden.includes(t.id));
+  const hiddenTopics = allOrdered.filter(t => hidden.includes(t.id));
+
+  banner.innerHTML = '';
+
+  // ── Collapsed header (always visible) ──────────────────────────────────
+  const header = document.createElement('div');
+  header.className = 'pgb-header';
+
+  const headerLabel = document.createElement('span');
+  headerLabel.textContent = 'Phase Goals';
+  header.appendChild(headerLabel);
+
+  if (!_bannerExpanded) {
+    const summary = document.createElement('span');
+    summary.className = 'pgb-header-summary';
+    summary.textContent = `— ${visible.length} topic${visible.length !== 1 ? 's' : ''}`;
+    header.appendChild(summary);
+  }
+
+  const arrow = document.createElement('span');
+  arrow.className = 'pgb-header-arrow' + (_bannerExpanded ? ' open' : '');
+  arrow.textContent = '▾';
+  header.appendChild(arrow);
+
+  header.onclick = () => { _bannerExpanded = !_bannerExpanded; renderGoalBanner(); };
+  banner.appendChild(header);
+
+  if (!_bannerExpanded) return; // collapsed: only show the 1-line header
+
+  // ── Expanded body ───────────────────────────────────────────────────────
+  const shown = showAllGoals ? visible : visible.slice(0, GOAL_LIMIT);
+  const hasMore = visible.length > GOAL_LIMIT;
+
+  const inner = document.createElement('div');
+  inner.className = 'pgb-inner';
+  banner.appendChild(inner);
+
+  shown.forEach(topic => {
+    const row = document.createElement('div');
+    row.className = 'pgb-topic-row';
+    row.draggable = true;
+    row.dataset.tid = topic.id;
+
+    // drag handle
+    const handle = document.createElement('span');
+    handle.className = 'pgb-drag-handle';
+    handle.title = 'Drag to reorder';
+    handle.textContent = '⠿';
+    row.appendChild(handle);
+
+    // color dot
+    const dot = document.createElement('div');
+    dot.className = 'pgb-dot';
+    dot.style.background = topic.color;
+    row.appendChild(dot);
+
+    // hide button — next to the name
+    const hideBtn = document.createElement('button');
+    hideBtn.className = 'pgb-hide-btn';
+    hideBtn.title = 'Hide from banner';
+    hideBtn.textContent = '×';
+    hideBtn.onclick = (e) => { e.stopPropagation(); _pgbHide(topic.id); };
+
+    // topic name
+    const name = document.createElement('span');
+    name.className = 'pgb-name';
+    name.textContent = topic.name;
+    row.appendChild(name);
+
+    row.appendChild(hideBtn); // immediately after name
+
+    // manual goal input
+    const inp = document.createElement('input');
+    inp.className = 'pgb-goal-input';
+    inp.placeholder = 'Goal…';
+    inp.value = goals[topic.id] || '';
+    inp.addEventListener('blur',  () => _pgbSaveGoal(topic.id, inp.value.trim()));
+    inp.addEventListener('keydown', e => { if (e.key === 'Enter') inp.blur(); });
+    inp.addEventListener('dragstart', e => e.stopPropagation());
+    row.appendChild(inp);
+
+    // drag-and-drop
+    row.addEventListener('dragstart', e => {
+      _pgbDragTopicId = topic.id;
+      e.dataTransfer.effectAllowed = 'move';
+      row.classList.add('pgb-dragging');
+    });
+    row.addEventListener('dragend', () => {
+      _pgbDragTopicId = null;
+      row.classList.remove('pgb-dragging');
+      inner.querySelectorAll('.pgb-drop-before,.pgb-drop-after')
+        .forEach(el => el.classList.remove('pgb-drop-before', 'pgb-drop-after'));
+    });
+    row.addEventListener('dragover', e => {
+      if (_pgbDragTopicId === null || _pgbDragTopicId === topic.id) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      inner.querySelectorAll('.pgb-drop-before,.pgb-drop-after')
+        .forEach(el => el.classList.remove('pgb-drop-before', 'pgb-drop-after'));
+      const rect = row.getBoundingClientRect();
+      if (e.clientY < rect.top + rect.height / 2) row.classList.add('pgb-drop-before');
+      else row.classList.add('pgb-drop-after');
+    });
+    row.addEventListener('dragleave', e => {
+      if (!e.relatedTarget || !row.contains(e.relatedTarget))
+        row.classList.remove('pgb-drop-before', 'pgb-drop-after');
+    });
+    row.addEventListener('drop', e => {
+      e.preventDefault();
+      row.classList.remove('pgb-drop-before', 'pgb-drop-after');
+      if (_pgbDragTopicId === null || _pgbDragTopicId === topic.id) return;
+      const orderedVisible = getOrderedBannerTopics(phases[currentPhase])
+        .filter(t => !(phases[currentPhase].bannerHidden||[]).includes(t.id));
+      const fromIdx = orderedVisible.findIndex(t => t.id === _pgbDragTopicId);
+      const toIdx   = orderedVisible.findIndex(t => t.id === topic.id);
+      if (fromIdx === -1 || toIdx === -1) return;
+      const rect = row.getBoundingClientRect();
+      const after = e.clientY >= rect.top + rect.height / 2;
+      const ids = orderedVisible.map(t => t.id);
+      const [moved] = ids.splice(fromIdx, 1);
+      const adj = fromIdx < toIdx ? toIdx - 1 : toIdx;
+      ids.splice(after ? adj + 1 : adj, 0, moved);
+      const hiddenIds = (phases[currentPhase].bannerHidden||[]);
+      phases[currentPhase].goalBannerOrder = [...ids, ...hiddenIds];
+      saveData();
+      renderGoalBanner();
+    });
+
+    inner.appendChild(row);
+  });
+
+  // show-more toggle
+  if (hasMore) {
+    const toggle = document.createElement('div');
+    toggle.className = 'pgb-toggle';
+    toggle.textContent = showAllGoals ? 'Show less ↑' : `Show all ${visible.length} topics ↓`;
+    toggle.onclick = toggleAllGoals;
+    inner.appendChild(toggle);
+  }
+
+  // hidden topics section
+  if (hiddenTopics.length) {
+    const showHiddenLink = document.createElement('div');
+    showHiddenLink.className = 'pgb-show-hidden';
+    showHiddenLink.textContent = _showHidden
+      ? 'Hide hidden topics ↑'
+      : `${hiddenTopics.length} hidden topic${hiddenTopics.length > 1 ? 's' : ''} ▾`;
+    showHiddenLink.onclick = () => { _showHidden = !_showHidden; renderGoalBanner(); };
+    inner.appendChild(showHiddenLink);
+
+    if (_showHidden) {
+      hiddenTopics.forEach(topic => {
+        const hrow = document.createElement('div');
+        hrow.className = 'pgb-hidden-row';
+        const dot = document.createElement('div');
+        dot.className = 'pgb-dot';
+        dot.style.background = topic.color;
+        hrow.appendChild(dot);
+        const nm = document.createElement('span');
+        nm.className = 'pgb-name';
+        nm.textContent = topic.name;
+        hrow.appendChild(nm);
+        const unhideBtn = document.createElement('button');
+        unhideBtn.className = 'pgb-unhide-btn';
+        unhideBtn.textContent = 'Unhide';
+        unhideBtn.onclick = () => _pgbUnhide(topic.id);
+        hrow.appendChild(unhideBtn);
+        inner.appendChild(hrow);
+      });
+    }
+  }
+}
+window.renderGoalBanner = renderGoalBanner;
+
+function toggleAllGoals() {
+  showAllGoals = !showAllGoals;
+  renderGoalBanner();
+}
+window.toggleAllGoals = toggleAllGoals;
 
 function renderTabs(){
   const rail=document.getElementById('phase-rail');
@@ -662,6 +956,7 @@ function renderTable(){
       }
     });
   });
+  renderGoalBanner();
   requestAnimationFrame(applyOverflow);
   renderMetrics();
   if(focusMode) renderFocusView();
@@ -1216,7 +1511,7 @@ function toggleConcludeSubject(tid,sid){
 
 function saveCurrentPhase(){try{localStorage.setItem(LS_PHASE_KEY,currentPhase);}catch(e){}}
 window.saveCurrentPhase=saveCurrentPhase;
-function setPhase(p){currentPhase=p;saveCurrentPhase();closePopover();renderTabs();renderTable();renderColNumbers();}
+function setPhase(p){currentPhase=p;showAllGoals=false;saveCurrentPhase();closePopover();renderTabs();renderTable();renderColNumbers();}
 
 // ── Re-open phase ────────────────────────────────────────────────────────────
 
@@ -1640,6 +1935,101 @@ function executeWizard(){
   renderTable();
   renderColNumbers();
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * _testGoalBanner — inline unit tests for renderGoalBanner logic.
+ * Runs once at startup; results appear in the browser console.
+ * Tests are pure (no DOM side-effects) and do not rely on live phase data.
+ */
+function _testGoalBanner() {
+  const T = (desc, cond) => {
+    if (!cond) console.error('FAIL:', desc);
+    else console.log('✓', desc);
+  };
+
+  // ── Fixture ──────────────────────────────────────────────────────────────
+  const mkPhase = (topicCount) => ({
+    topics: Array.from({length: topicCount}, (_, i) => ({
+      id: i + 1,
+      name: `Topic${i + 1}`,
+      color: '#aaa',
+      subjects: [{ id: i + 1, name: 'S', goal: i % 2 === 0 ? `Goal${i}` : '', tasks: [] }]
+    }))
+  });
+
+  // ── Test 1: GOAL_LIMIT cap ────────────────────────────────────────────────
+  const ph4 = mkPhase(5);
+  const shown = ph4.topics.filter(t => !t.archived).slice(0, GOAL_LIMIT);
+  T('shows exactly GOAL_LIMIT (3) topics by default', shown.length === 3);
+
+  // ── Test 2: show-all returns full list ────────────────────────────────────
+  const all = ph4.topics.filter(t => !t.archived);
+  T('show-all returns all 5 topics', all.length === 5);
+
+  // ── Test 3: fewer topics than GOAL_LIMIT — no toggle needed ──────────────
+  const ph2 = mkPhase(2);
+  const hasMore = ph2.topics.length > GOAL_LIMIT;
+  T('no toggle when topics < GOAL_LIMIT', !hasMore);
+
+  // ── Test 4: goals extraction strips empty strings ─────────────────────────
+  const goals = ph4.topics[0].subjects.map(s => s.goal).filter(Boolean);
+  T('topic 1 has one non-empty goal', goals.length === 1 && goals[0] === 'Goal0');
+
+  const goalsEmpty = ph4.topics[1].subjects.map(s => s.goal).filter(Boolean);
+  T('topic 2 has no non-empty goals', goalsEmpty.length === 0);
+
+  // ── Test 5: archived topics are excluded ─────────────────────────────────
+  const phA = mkPhase(4);
+  phA.topics[0].archived = true;
+  const visible = phA.topics.filter(t => !t.archived);
+  T('archived topics excluded', visible.length === 3);
+
+  // ── Test 6: getOrderedBannerTopics respects goalBannerOrder ──────────────
+  const phO = mkPhase(4);
+  phO.goalBannerOrder = [4, 2, 1, 3];
+  const orderedAll = getOrderedBannerTopics(phO);
+  T('goalBannerOrder: first item correct', orderedAll[0].id === 4);
+  T('goalBannerOrder: second item correct', orderedAll[1].id === 2);
+  T('goalBannerOrder: all 4 topics returned', orderedAll.length === 4);
+
+  // ── Test 7: topics not in goalBannerOrder appended at end ─────────────────
+  const phP = mkPhase(4);
+  phP.goalBannerOrder = [3, 1]; // ids 2 and 4 missing
+  const orderedPartial = getOrderedBannerTopics(phP);
+  T('partial order: ordered topics first', orderedPartial[0].id === 3 && orderedPartial[1].id === 1);
+  T('partial order: remaining appended', orderedPartial.length === 4);
+
+  // ── Test 8: drag reorder — moving item forward ────────────────────────────
+  const ids8 = [1, 2, 3, 4];
+  const fromIdx8 = 0, toIdx8 = 2, after8 = false;
+  const [moved8] = ids8.splice(fromIdx8, 1);
+  const adj8 = fromIdx8 < toIdx8 ? toIdx8 - 1 : toIdx8;
+  ids8.splice(after8 ? adj8 + 1 : adj8, 0, moved8);
+  T('drag reorder: [1,2,3,4] move 1 before 3 → [2,1,3,4]', ids8.join(',') === '2,1,3,4');
+
+  // ── Test 9: hide topic — excluded from visible list ───────────────────────
+  const phH = mkPhase(4);
+  phH.bannerHidden = [2];
+  const ordH = getOrderedBannerTopics(phH);
+  const visH = ordH.filter(t => !(phH.bannerHidden||[]).includes(t.id));
+  T('hidden topic excluded from visible', visH.length === 3 && visH.every(t => t.id !== 2));
+
+  // ── Test 10: unhide restores topic ────────────────────────────────────────
+  phH.bannerHidden = phH.bannerHidden.filter(id => id !== 2);
+  const visH2 = getOrderedBannerTopics(phH).filter(t => !(phH.bannerHidden||[]).includes(t.id));
+  T('unhide restores topic', visH2.length === 4);
+
+  // ── Test 11: manual goal stored and retrieved ─────────────────────────────
+  const phG = mkPhase(3);
+  phG.bannerGoals = { 2: 'Ship it' };
+  T('manual goal retrieved by topicId', (phG.bannerGoals||{})[2] === 'Ship it');
+  T('missing goal returns undefined (not error)', (phG.bannerGoals||{})[99] === undefined);
+
+  console.log('Goal banner tests done.');
+}
+_testGoalBanner();
 
 // ────────────────────────────────────────────────────────────────────────────
 
