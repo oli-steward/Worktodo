@@ -896,9 +896,9 @@ function renderTable(){
       const wrap=document.createElement('div');
       wrap.className='tasks-inline';
       wrap.id=`row-${topic.id}-${sub.id}`;
-      (showAllTasks?sub.tasks:sub.tasks.filter(t=>!t.done)).slice(0,showAllTasks?undefined:3).forEach(t=>{
+      (showAllTasks||sub.concluded?sub.tasks:sub.tasks.filter(t=>!t.done)).slice(0,showAllTasks?undefined:3).forEach(t=>{
         const chip=document.createElement('div');
-        const pClass=(t.done&&showAllTasks)?' done':t.priority==='urgent'?' urgent':t.priority==='future'?' future':t.priority==='nextphase'?' nextphase':'';
+        const pClass=(t.done||sub.concluded)?' done':t.priority==='urgent'?' urgent':t.priority==='future'?' future':t.priority==='nextphase'?' nextphase':'';
         chip.className='task-chip'+pClass;
         chip.innerHTML=`<span class="task-drag-handle" title="Drag to reorder">⠿</span><div class="chip-check"></div><span class="chip-label">${t.text}</span>`;
         chip.onclick=(e)=>{if(e.target.closest('.task-drag-handle')) return; toggleTask(topic.id,sub.id,t.id);};
