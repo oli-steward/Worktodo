@@ -268,6 +268,7 @@ const SUPABASE_URL='https://dzksworkkpbnghsxqskk.supabase.co';
 const SUPABASE_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR6a3N3b3Jra3Bibmdoc3hxc2trIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzcxMzEwMjYsImV4cCI6MjA5MjcwNzAyNn0.19b41BwAewSsUCQcxOU1JVqT_b76b0ZrS9-EtccmAIw';
 const sb=supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
 const DEVICE_ID='os_projects_main';
+let _sbSaveTimer=null;
 let colorIdx=0,nextTid=200,nextSid=200,currentPhase='PH4',openPopover=null;
 
 const defaultData={
@@ -389,22 +390,32 @@ function resetToDefault(){
 let phases=loadData();
 
 function saveData(){
+  // localStorage stays synchronous: data survives a tab close even if the
+  // debounced remote write has not fired yet.
   try{localStorage.setItem(LS_KEY,JSON.stringify(phases));}catch(e){}
   const ind=document.getElementById('save-indicator');
-  ind.textContent='Saving...';
-  ind.style.opacity='1';
-  sb.from('os_projects').upsert({id:DEVICE_ID,data:JSON.stringify(phases),updated_at:new Date().toISOString()})
-    .then(({error})=>{
-      if(error){ind.textContent='Saved locally';console.warn('Supabase save error:',error);}
-      else ind.textContent='Synced';
-      clearTimeout(ind._t);
-      ind._t=setTimeout(()=>{ind.style.opacity='0';},1500);
-    });
+  if(ind){ind.textContent='Saving...';ind.style.opacity='1';}
+  // Debounced: coalesces rapid mutations into a single Supabase upsert.
+  clearTimeout(_sbSaveTimer);
+  _sbSaveTimer=setTimeout(()=>{
+    sb.from('os_projects').upsert({id:DEVICE_ID,data:JSON.stringify(phases),updated_at:new Date().toISOString()})
+      .then(({error})=>{
+        if(!ind) return;
+        if(error){ind.textContent='Saved locally';console.warn('Supabase save error:',error);}
+        else ind.textContent='Synced';
+        clearTimeout(ind._t);
+        ind._t=setTimeout(()=>{ind.style.opacity='0';},1500);
+      });
+  },300);
 }
 
 async function loadFromSupabase(){
   try{
-    const {data,error}=await sb.from('os_projects').select('data').eq('id',DEVICE_ID).single();
+    // Race the query against a 2s timeout: without this a hung connection
+    // blocks the startup IIFE forever and the page never renders.
+    const timeout=new Promise((_,rej)=>setTimeout(()=>rej(new Error('Supabase load timeout')),2000));
+    const query=sb.from('os_projects').select('data').eq('id',DEVICE_ID).single();
+    const {data,error}=await Promise.race([query,timeout]);
     if(error||!data) return null;
     const parsed=JSON.parse(data.data);
     const hasData=Object.keys(defaultData).some(k=>parsed[k]&&parsed[k].topics&&parsed[k].topics.length>0);
@@ -1269,6 +1280,7 @@ function exportNowTasks(){
 function forceReset(){
   if(!confirm('This will reload all default topics and tasks. Continue?')) return;
   phases=resetToDefault();
+  saveData();   // push the reset remotely, otherwise Supabase keeps the old data
   renderTabs();
   renderTable();
 }
@@ -1688,7 +1700,7 @@ function transitionTopics(phasesData, fromKey, toKey, selectedTopicIds){
 window.transitionTopics=transitionTopics;
 
 function getNextPhaseKey(phasesData,phaseKey){
-  const keys=Object.keys(phasesData);
+  const keys=getSortedPhaseKeys(phasesData);   // was Object.keys(): insertion order is unreliable
   const idx=keys.indexOf(phaseKey);
   return (idx===-1||idx>=keys.length-1)?null:keys[idx+1];
 }
@@ -2043,18 +2055,16 @@ window.addEventListener('scroll',saveScrollPos,{passive:true});
 
 (async()=>{
   const ind=document.getElementById('save-indicator');
-  ind.textContent='Loading...';
-  ind.style.opacity='1';
+  if(ind){ind.textContent='Loading...';ind.style.opacity='1';}
   const remote=await loadFromSupabase();
   if(remote){
     phases=remote;
     try{localStorage.setItem(LS_KEY,JSON.stringify(phases));}catch(e){}
-    ind.textContent='Synced';
+    if(ind) ind.textContent='Synced';
   } else {
-    ind.textContent='Local';
+    if(ind) ind.textContent='Local';
   }
-  clearTimeout(ind._t);
-  ind._t=setTimeout(()=>{ind.style.opacity='0';},1500);
+  if(ind){clearTimeout(ind._t);ind._t=setTimeout(()=>{ind.style.opacity='0';},1500);}
   const savedPhase=localStorage.getItem(LS_PHASE_KEY);
   if(savedPhase&&phases[savedPhase]) currentPhase=savedPhase;
   renderTabs();
