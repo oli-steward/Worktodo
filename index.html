@@ -218,6 +218,7 @@ thead th{font-size:11px;font-weight:500;color:#888;text-transform:uppercase;lett
   <div class="topbar">
     <h1>OS Projects</h1>
     <span class="save-indicator" id="save-indicator"></span>
+    <button class="export-btn" id="file-btn" onclick="toggleFileMenu(event)">File</button>
     <button class="export-btn" onclick="backupData()">&#8681; Backup</button>
     <button class="export-btn" onclick="document.getElementById('restore-input').click()">&#8679; Restore</button>
     <input type="file" id="restore-input" accept=".json" style="display:none" onchange="restoreData(this)">
@@ -408,6 +409,347 @@ function saveData(){
       });
   },300);
 }
+
+// ── Undo / Redo / History ────────────────────────────────────────────────────
+// One wrapper around saveData() records every mutation as a JSON snapshot, so
+// none of the existing saveData() call sites need to change. Only `currentPhase`
+// travels with a snapshot; every other UI-state global is deliberately excluded.
+
+const HISTORY_LIMIT=50;
+let _histPast=[], _histFuture=[], _histCur=null, _histBaseline=null, _histSuspend=false, _histLabel=null, _histLabelTimer=null;
+
+/**
+ * _histCounts — count every node in a parsed phases tree.
+ * Pure: takes the parsed object as an argument and reads no globals.
+ */
+function _histCounts(obj){
+  const out={phases:0,topics:0,subjects:0,tasks:0,done:0};
+  if(!obj||typeof obj!=='object') return out;
+  Object.keys(obj).forEach(pk=>{
+    const ph=obj[pk];
+    if(!ph||typeof ph!=='object') return;
+    out.phases++;
+    const topics=Array.isArray(ph.topics)?ph.topics:[];
+    topics.forEach(tp=>{
+      out.topics++;
+      const subs=(tp&&Array.isArray(tp.subjects))?tp.subjects:[];
+      subs.forEach(su=>{
+        out.subjects++;
+        const tasks=(su&&Array.isArray(su.tasks))?su.tasks:[];
+        tasks.forEach(tk=>{out.tasks++;if(tk&&tk.done) out.done++;});
+      });
+    });
+  });
+  return out;
+}
+
+/**
+ * _histDiffLabel — short human label describing what changed between two
+ * JSON snapshots. Pure: string in, string out. Unparseable input → 'Edit'.
+ */
+function _histDiffLabel(prevJson,nextJson){
+  let a,b;
+  try{a=_histCounts(JSON.parse(prevJson));b=_histCounts(JSON.parse(nextJson));}
+  catch(e){return 'Edit';}
+  if(b.phases!==a.phases)   return b.phases>a.phases?'Phase added':'Phase deleted';
+  if(b.topics!==a.topics)   return b.topics>a.topics?'Topic added':'Topic deleted';
+  if(b.subjects!==a.subjects) return b.subjects>a.subjects?'Subject added':'Subject deleted';
+  if(b.tasks!==a.tasks){
+    const d=b.tasks-a.tasks, verb=d>0?'added':'deleted', n=Math.abs(d);
+    return n>1?(n+' tasks '+verb):('Task '+verb);
+  }
+  if(b.done!==a.done)       return b.done>a.done?'Task completed':'Task reopened';
+  return 'Edit';
+}
+
+/** _histSnap — snapshot of the live state. Not pure (reads phases/currentPhase). */
+function _histSnap(label){
+  return {json:JSON.stringify(phases),phase:currentPhase,label:label||'Edit',ts:Date.now()};
+}
+
+/** _histInit — (re)seed history and the Revert baseline from the live state. */
+function _histInit(){
+  _histPast=[]; _histFuture=[];
+  _histCur=_histSnap('Loaded');
+  _histBaseline=_histCur;
+  _histLabel=null;
+}
+
+/** _histRebase — re-anchor the Revert baseline without discarding undo history.
+ *  Used when the async Supabase load lands after the user has already edited. */
+function _histRebase(){
+  _histBaseline=_histSnap('Loaded');
+  _histCur=_histBaseline;
+  _histLabel=null;
+}
+
+// Wrap saveData: `saveData` is a function declaration, so reassigning it here
+// means all later call sites (all of which run at event time) hit the wrapper.
+const _origSaveData=saveData;
+saveData=function(){
+  if(!_histSuspend){
+    const json=JSON.stringify(phases);
+    if(_histCur && _histCur.json!==json){
+      _histPast.push(_histCur);
+      if(_histPast.length>HISTORY_LIMIT) _histPast.shift();
+      _histFuture.length=0;              // a new branch invalidates redo
+    }
+    if(!_histCur || _histCur.json!==json){
+      _histCur={json:json,phase:currentPhase,
+                label:_histLabel || _histDiffLabel(_histCur?_histCur.json:json,json),
+                ts:Date.now()};
+    }
+    _histLabel=null; clearTimeout(_histLabelTimer);
+  }
+  _origSaveData();
+};
+
+/** _histApply — restore a snapshot and repaint. Recording is suspended, but the
+ *  restored state is still persisted (the wrapper always delegates). */
+function _histApply(entry){
+  if(!entry) return false;
+  // Keep a rollback copy: if the snapshot is unrenderable we must not leave the
+  // app on a half-applied state with a blank table.
+  const _prevJson=JSON.stringify(phases), _prevPhase=currentPhase;
+  _histSuspend=true;
+  try{
+    phases=JSON.parse(entry.json);
+    if(entry.phase && phases[entry.phase]) currentPhase=entry.phase;
+    if(!phases[currentPhase]){
+      const ks=getSortedPhaseKeys(phases);
+      if(ks.length) currentPhase=ks[0];
+      // An empty phases object has no valid phase to show; refuse the snapshot
+      // rather than letting renderTable() throw on phases[undefined].topics.
+      else throw new Error('snapshot contains no phases');
+    }
+    closePopover(); closeWizard();
+    saveData();
+    // keep LS_PHASE_KEY in step with the restored phase; guarded so a failure here
+    // can never trigger the rollback path below.
+    try{ if(typeof saveCurrentPhase==="function") saveCurrentPhase(); }catch(e){}
+    renderTabs(); renderTable(); renderColNumbers();
+    return true;
+  }catch(err){
+    console.error('History: could not apply snapshot, rolling back.',err);
+    try{
+      phases=JSON.parse(_prevJson); currentPhase=_prevPhase;
+      renderTabs(); renderTable(); renderColNumbers();
+    }catch(e2){ console.error('History: rollback also failed.',e2); }
+    return false;
+  }finally{ _histSuspend=false; }
+}
+
+function _histToast(msg){
+  const toast=document.getElementById('export-toast');
+  if(!toast) return;
+  toast.textContent=msg;
+  toast.style.opacity='1';
+  clearTimeout(toast._t);
+  toast._t=setTimeout(()=>{toast.style.opacity='0';toast.textContent='Downloaded!';},1400);
+}
+
+function undo(){
+  if(_histPast.length===0){_histToast('Nothing to undo');return false;}
+  const label=_histCur?_histCur.label:'';
+  _histFuture.unshift(_histCur);
+  _histCur=_histPast.pop();
+  _histApply(_histCur);
+  _histToast('Undo: '+label);
+  renderHistoryPanel();
+  return true;
+}
+
+function redo(){
+  if(_histFuture.length===0){_histToast('Nothing to redo');return false;}
+  _histPast.push(_histCur);
+  if(_histPast.length>HISTORY_LIMIT) _histPast.shift();
+  _histCur=_histFuture.shift();
+  _histApply(_histCur);
+  _histToast('Redo: '+_histCur.label);
+  renderHistoryPanel();
+  return true;
+}
+
+// ── File menu ────────────────────────────────────────────────────────────────
+function closeFileMenu(){const el=document.getElementById('file-menu'); if(el) el.remove();}
+
+function toggleFileMenu(e){
+  if(e&&e.stopPropagation) e.stopPropagation();
+  if(document.getElementById('file-menu')){closeFileMenu();return;}
+  const btn=document.getElementById('file-btn');
+  if(!btn) return;
+  const r=btn.getBoundingClientRect();
+  const menu=document.createElement('div');
+  menu.id='file-menu';
+  menu.style.cssText='position:fixed;left:'+Math.round(r.left)+'px;top:'+Math.round(r.bottom+4)+'px;z-index:21;background:#fff;border:0.5px solid #ccc;border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.08);padding:4px;min-width:170px';
+  const item=(label,hint,disabled,fn)=>{
+    const row=document.createElement('div');
+    row.style.cssText='display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;padding:5px 10px;border-radius:4px;cursor:'+(disabled?'default':'pointer')+';color:'+(disabled?'#ccc':'#666');
+    const l=document.createElement('span'); l.textContent=label; row.appendChild(l);
+    if(hint){const h=document.createElement('span'); h.style.cssText='font-size:10px;color:'+(disabled?'#ddd':'#aaa'); h.textContent=hint; row.appendChild(h);}
+    if(!disabled){
+      row.onmouseenter=()=>{row.style.background='#f5f5f5';row.style.color='#1a1a1a';};
+      row.onmouseleave=()=>{row.style.background='transparent';row.style.color='#666';};
+      row.onclick=()=>{closeFileMenu();fn();};
+    }
+    menu.appendChild(row);
+  };
+  item('Undo','Ctrl+Z',_histPast.length===0,undo);
+  item('Redo','Ctrl+Y',_histFuture.length===0,redo);
+  const sep=document.createElement('div');
+  sep.style.cssText='border-top:0.5px solid #eee;margin:4px 6px';
+  menu.appendChild(sep);
+  item('History…','Ctrl+H',false,openHistoryPanel);
+  item('Revert to Saved','',false,revertToSaved);
+  document.body.appendChild(menu);
+  setTimeout(()=>{document.addEventListener('click',closeFileMenu,{once:true});},0);
+}
+
+// ── History panel ────────────────────────────────────────────────────────────
+function closeHistoryPanel(){const el=document.getElementById('history-panel'); if(el) el.remove();}
+
+function _histList(){return [..._histPast,_histCur,..._histFuture].filter(Boolean);}
+
+function renderHistoryPanel(){
+  const list=document.getElementById('history-list');
+  if(!list) return;
+  list.innerHTML='';
+  const all=_histList();
+  const curIdx=_histPast.length;
+  if(all.length<=1){
+    const empty=document.createElement('div');
+    empty.style.cssText='font-size:12px;color:#888;padding:8px 4px';
+    empty.textContent='No edits yet this session.';
+    list.appendChild(empty);
+    return;
+  }
+  all.forEach((entry,i)=>{
+    const isCur=i===curIdx, isFuture=i>curIdx;
+    const row=document.createElement('div');
+    row.style.cssText='display:flex;align-items:center;gap:8px;font-size:12px;padding:5px 8px;border-radius:4px;cursor:pointer;color:'+(isCur?'#1a1a1a':(isFuture?'#aaa':'#666'))+(isCur?';font-weight:500':'');
+    row.onmouseenter=()=>{row.style.background='#f5f5f5';};
+    row.onmouseleave=()=>{row.style.background='transparent';};
+    const mark=document.createElement('span');
+    mark.style.cssText='width:8px;flex:0 0 8px;color:#1D9E75';
+    mark.textContent=isCur?'•':'';
+    const lab=document.createElement('span');
+    lab.style.cssText='flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    lab.textContent=entry.label||'Edit';
+    const time=document.createElement('span');
+    time.style.cssText='font-size:10px;color:#aaa;flex:0 0 auto';
+    time.textContent=entry.ts?new Date(entry.ts).toLocaleTimeString():'';
+    row.appendChild(mark);row.appendChild(lab);row.appendChild(time);
+    row.onclick=()=>{
+      if(i===curIdx) return;
+      const combined=_histList();
+      _histPast=combined.slice(0,i);
+      _histFuture=combined.slice(i+1);
+      _histCur=combined[i];
+      _histApply(_histCur);
+      renderHistoryPanel();
+    };
+    list.appendChild(row);
+  });
+}
+
+function openHistoryPanel(){
+  closeFileMenu();
+  if(document.getElementById('history-panel')) {renderHistoryPanel();return;}
+  const overlay=document.createElement('div');
+  overlay.id='history-panel';
+  overlay.style.cssText='position:fixed;inset:0;z-index:22;background:rgba(0,0,0,0.18);display:flex;align-items:center;justify-content:center';
+  const box=document.createElement('div');
+  box.style.cssText='background:#fff;border-radius:10px;padding:16px;max-width:440px;width:90%;border:0.5px solid #ccc;box-shadow:0 4px 16px rgba(0,0,0,.08);max-height:85vh;overflow-y:auto';
+  box.onclick=e=>e.stopPropagation();
+  const title=document.createElement('div');
+  title.style.cssText='font-size:13px;font-weight:500;color:#1a1a1a';
+  title.textContent='History';
+  const sub=document.createElement('div');
+  sub.style.cssText='font-size:12px;color:#888;padding:2px 0 10px';
+  sub.textContent='Click any step to revert to that moment.';
+  const list=document.createElement('div');
+  list.id='history-list';
+  const footer=document.createElement('div');
+  footer.style.cssText='display:flex;gap:6px;justify-content:space-between;padding-top:8px;border-top:0.5px solid #eee;margin-top:10px';
+  const revertBtn=document.createElement('button');
+  revertBtn.className='export-btn';
+  revertBtn.textContent='Revert to Saved';
+  revertBtn.onclick=revertToSaved;
+  const closeBtn=document.createElement('button');
+  closeBtn.className='export-btn';
+  closeBtn.textContent='Close';
+  closeBtn.onclick=closeHistoryPanel;
+  footer.appendChild(revertBtn);footer.appendChild(closeBtn);
+  box.appendChild(title);box.appendChild(sub);box.appendChild(list);box.appendChild(footer);
+  overlay.appendChild(box);
+  overlay.onclick=closeHistoryPanel;
+  document.body.appendChild(overlay);
+  renderHistoryPanel();
+}
+
+// ── Revert to the state the page was loaded with ─────────────────────────────
+function revertToSaved(){
+  closeFileMenu();
+  if(!_histBaseline){alert('No saved state is available to revert to yet.');return;}
+  if(!confirm('Discard all changes made since this page was loaded?')) return;
+  if(_histCur && _histCur.json===_histBaseline.json){_histToast('Already at the saved state');return;}
+  if(_histCur){
+    _histPast.push(_histCur);
+    if(_histPast.length>HISTORY_LIMIT) _histPast.shift();
+  }
+  _histFuture.length=0;
+  _histCur={json:_histBaseline.json,phase:_histBaseline.phase,label:'Revert to saved',ts:Date.now()};
+  _histApply(_histCur);
+  _histToast('Reverted to saved');
+  renderHistoryPanel();
+}
+
+// ── Keyboard: Ctrl/Cmd+Z undo, Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z redo, Ctrl+H ──
+// Ctrl+R is intentionally NOT bound: it must stay browser reload.
+document.addEventListener('keydown',(e)=>{
+  const t=e.target;
+  if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable)) return;
+  if(e.key==='Escape'){
+    if(document.getElementById('file-menu')){closeFileMenu();return;}
+    if(document.getElementById('history-panel')){closeHistoryPanel();return;}
+    return;
+  }
+  const mod=e.ctrlKey||e.metaKey;
+  if(!mod) return;
+  const k=(e.key||'').toLowerCase();
+  if(k==='z' && !e.shiftKey){e.preventDefault(); undo();}
+  else if(k==='y' || (k==='z'&&e.shiftKey)){e.preventDefault(); redo();}
+  else if(k==='h'){e.preventDefault(); openHistoryPanel();}
+});
+
+window._histCounts=_histCounts;
+window._histDiffLabel=_histDiffLabel;
+window._histSnap=_histSnap;
+window._histInit=_histInit;
+window._histApply=_histApply;
+window._histRebase=_histRebase;
+window.undo=undo;
+window.redo=redo;
+window.toggleFileMenu=toggleFileMenu;
+window.openHistoryPanel=openHistoryPanel;
+window.closeHistoryPanel=closeHistoryPanel;
+window.revertToSaved=revertToSaved;
+/** _histSetLabel — arm a one-shot label for the NEXT saveData() in this tick.
+ *  Self-expires on the next macrotask so an abandoned action (e.g. a declined
+ *  confirm() that returns before saving) cannot mislabel a later, unrelated edit. */
+function _histSetLabel(s){
+  _histLabel=s;
+  clearTimeout(_histLabelTimer);
+  _histLabelTimer=setTimeout(()=>{_histLabel=null;},0);
+}
+window._histSetLabel=_histSetLabel;
+window._setHistLabel=_histSetLabel;   // back-compat alias
+
+// Seed immediately so history is valid even if the startup IIFE never settles;
+// the IIFE re-seeds it once the Supabase sync has landed.
+_histInit();
+
+// ────────────────────────────────────────────────────────────────────────────
 
 async function loadFromSupabase(){
   try{
@@ -1280,6 +1622,7 @@ function exportNowTasks(){
 function forceReset(){
   if(!confirm('This will reload all default topics and tasks. Continue?')) return;
   phases=resetToDefault();
+  _histSetLabel('Reset data');
   saveData();   // push the reset remotely, otherwise Supabase keeps the old data
   renderTabs();
   renderTable();
@@ -1496,6 +1839,7 @@ function restoreData(input){
       if(!hasData) throw new Error('Backup appears empty');
       if(!confirm(`Restore backup from ${payload.timestamp||'unknown date'}? This will overwrite all current data.`)) return;
       phases=payload.phases;
+      _histSetLabel('Restore backup');
       saveData();
       renderTabs();
       renderTable();
@@ -1548,6 +1892,7 @@ function deletePhase(){
   const remaining=Object.keys(phases);
   currentPhase=remaining[Math.min(idx,remaining.length-1)];
   saveCurrentPhase();
+  _histSetLabel('Delete phase');
   saveData();
   renderTabs();
   renderTable();
@@ -1942,6 +2287,7 @@ function executeWizard(){
   closeWizard();
   currentPhase=newKey;
   saveCurrentPhase();
+  _histSetLabel('Conclude phase');
   saveData();
   renderTabs();
   renderTable();
@@ -2043,6 +2389,81 @@ function _testGoalBanner() {
 }
 _testGoalBanner();
 
+/**
+ * _testHistory — inline unit tests for the undo/redo history helpers.
+ * Runs once at startup; results appear in the browser console.
+ * Tests are pure (no DOM side-effects) and never touch live phase data.
+ */
+function _testHistory() {
+  const T = (desc, cond) => {
+    if (!cond) console.error('FAIL:', desc);
+    else console.log('✓', desc);
+  };
+  // Fixture builder: n tasks in one subject of one topic of one phase.
+  const mk = (taskTexts, doneFlags) => ({
+    PH1: { label: 'Phase 1', topics: [
+      { id: 1, name: 'T', color: '#000', subjects: [
+        { id: 1, name: 'S', goal: '', tasks: taskTexts.map((tx, i) => ({ id: i + 1, text: tx, done: !!(doneFlags && doneFlags[i]) })) }
+      ] }
+    ] }
+  });
+  const J = o => JSON.stringify(o);
+
+  // ── Test 1: _histCounts on a fixture ──────────────────────────────────────
+  const c = _histCounts(mk(['a', 'b', 'c'], [true, false, false]));
+  T('counts 1 phase', c.phases === 1);
+  T('counts 1 topic', c.topics === 1);
+  T('counts 1 subject', c.subjects === 1);
+  T('counts 3 tasks', c.tasks === 3);
+  T('counts 1 done', c.done === 1);
+  T('counts on null returns zeros', _histCounts(null).phases === 0);
+
+  // ── Test 2: task added / deleted ──────────────────────────────────────────
+  T('one task added', _histDiffLabel(J(mk(['a'])), J(mk(['a', 'b']))) === 'Task added');
+  T('one task deleted', _histDiffLabel(J(mk(['a', 'b'])), J(mk(['a']))) === 'Task deleted');
+
+  // ── Test 3: plural task delta ─────────────────────────────────────────────
+  T('three tasks added', _histDiffLabel(J(mk(['a'])), J(mk(['a', 'b', 'c', 'd']))) === '3 tasks added');
+  T('two tasks deleted', _histDiffLabel(J(mk(['a', 'b', 'c'])), J(mk(['a']))) === '2 tasks deleted');
+
+  // ── Test 4: completion toggles ────────────────────────────────────────────
+  T('task completed', _histDiffLabel(J(mk(['a', 'b'], [false, false])), J(mk(['a', 'b'], [true, false]))) === 'Task completed');
+  T('task reopened', _histDiffLabel(J(mk(['a', 'b'], [true, false])), J(mk(['a', 'b'], [false, false]))) === 'Task reopened');
+
+  // ── Test 5: topic / subject / phase deltas ────────────────────────────────
+  const twoTopics = mk(['a']);
+  twoTopics.PH1.topics.push({ id: 2, name: 'T2', color: '#111', subjects: [] });
+  T('topic added', _histDiffLabel(J(mk(['a'])), J(twoTopics)) === 'Topic added');
+  T('topic deleted', _histDiffLabel(J(twoTopics), J(mk(['a']))) === 'Topic deleted');
+
+  const twoSubs = mk(['a']);
+  twoSubs.PH1.topics[0].subjects.push({ id: 2, name: 'S2', goal: '', tasks: [] });
+  T('subject added', _histDiffLabel(J(mk(['a'])), J(twoSubs)) === 'Subject added');
+  T('subject deleted', _histDiffLabel(J(twoSubs), J(mk(['a']))) === 'Subject deleted');
+
+  const twoPhases = mk(['a']);
+  twoPhases.PH2 = { label: 'Phase 2', topics: [] };
+  T('phase added', _histDiffLabel(J(mk(['a'])), J(twoPhases)) === 'Phase added');
+  T('phase deleted', _histDiffLabel(J(twoPhases), J(mk(['a']))) === 'Phase deleted');
+
+  // ── Test 6: precedence — phase change wins over task change ───────────────
+  const phasePlusTasks = mk(['a', 'b', 'c']);
+  phasePlusTasks.PH2 = { label: 'Phase 2', topics: [] };
+  T('phase delta outranks task delta', _histDiffLabel(J(mk(['a'])), J(phasePlusTasks)) === 'Phase added');
+
+  // ── Test 7: no structural change → 'Edit' ─────────────────────────────────
+  T('identical input is Edit', _histDiffLabel(J(mk(['a'])), J(mk(['a']))) === 'Edit');
+  T('rename only is Edit', _histDiffLabel(J(mk(['a'])), J(mk(['renamed']))) === 'Edit');
+
+  // ── Test 8: malformed JSON → 'Edit' ───────────────────────────────────────
+  T('malformed prev is Edit', _histDiffLabel('{not json', J(mk(['a']))) === 'Edit');
+  T('malformed next is Edit', _histDiffLabel(J(mk(['a'])), 'undefined{') === 'Edit');
+  T('both malformed is Edit', _histDiffLabel('x', 'y') === 'Edit');
+
+  console.log('History tests done.');
+}
+_testHistory();
+
 // ────────────────────────────────────────────────────────────────────────────
 
 window.addEventListener('resize',()=>requestAnimationFrame(applyOverflow));
@@ -2067,6 +2488,9 @@ window.addEventListener('scroll',saveScrollPos,{passive:true});
   if(ind){clearTimeout(ind._t);ind._t=setTimeout(()=>{ind.style.opacity='0';},1500);}
   const savedPhase=localStorage.getItem(LS_PHASE_KEY);
   if(savedPhase&&phases[savedPhase]) currentPhase=savedPhase;
+  // If the user edited during the ~2s remote-load window, keep their undo
+  // history and only re-anchor the Revert baseline.
+  if(_histPast.length===0) _histInit(); else _histRebase();
   renderTabs();
   renderTable();
   renderColNumbers();
@@ -2098,6 +2522,7 @@ function importXlsx(input){
       });
 
       if(imported===0){alert('No matching sheets found. Make sure your sheets are named: Projects PH2, Projects PH3, Projects PH4');return;}
+      _histSetLabel('Import Excel');
       saveData();
       renderTabs();
       renderTable();
@@ -2211,6 +2636,7 @@ function syncFromGSheets(){
         imported++;
       });
       if(imported===0) throw new Error('No matching sheets found (Projects PH2/3/4/5).');
+      _histSetLabel('Sync Google Sheet');
       saveData();
       renderTabs();
       renderTable();
