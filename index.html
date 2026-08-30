@@ -1258,7 +1258,7 @@ function renderTable(){
         chip.innerHTML=`<span class="task-drag-handle" title="Drag to reorder">⠿</span><div class="chip-check"></div><span class="chip-label">${t.text}</span>`;
         chip.onclick=(e)=>{if(e.target.closest('.task-drag-handle')) return; toggleTask(topic.id,sub.id,t.id);};
         chip.oncontextmenu=(e)=>{e.preventDefault();cyclePriority(topic.id,sub.id,t.id);};
-        chip.title='Right-click to set priority';
+        chip.title='Right-click to cycle priority: none → now → next phase → later';
         const realIdx=sub.tasks.findIndex(tk=>tk.id===t.id);
         chip.draggable=true;
         chip.addEventListener('dragstart',e=>{
@@ -1544,9 +1544,9 @@ function cyclePriority(tid,sid,taskId){
   const s=t&&t.subjects.find(x=>x.id===sid);
   const tk=s&&s.tasks.find(x=>x.id===taskId);
   if(!tk) return;
-  const order=[undefined,"urgent","future"];
+  const order=[undefined,"urgent","nextphase","future"];
   const idx=order.indexOf(tk.priority);
-  tk.priority=order[(idx+1)%3];
+  tk.priority=order[(idx+1)%order.length];
   saveData();
   renderTable();
 }
