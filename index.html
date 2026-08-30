@@ -147,6 +147,10 @@ thead th{font-size:11px;font-weight:500;color:#888;text-transform:uppercase;lett
 .focus-item.focus-drop-before{border-top:2px solid #378ADD;border-bottom:none}
 .focus-item.focus-drop-after{border-bottom:2px solid #378ADD}
 .focus-item.focus-item-urgent{background:rgba(224,58,58,0.07);border-radius:6px;padding-left:6px;padding-right:6px}.focus-item.focus-item-urgent .focus-task-text{font-weight:500}
+.focus-item.focus-cat-nextphase .focus-task-text{color:#7F77DD}
+.focus-item.focus-cat-future .focus-task-text{color:#E8846A}
+.export-btn.mode-active{background:#1a1a1a;color:#fff;border-color:#1a1a1a}
+.export-btn.mode-active:hover{background:#1a1a1a;color:#fff}
 
 .subj-concluded{text-decoration:line-through;color:#bbb}
 .subj-check-badge{width:13px;height:13px;border-radius:50%;background:#1D9E75;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;vertical-align:middle;margin-right:4px}
@@ -229,6 +233,8 @@ thead th{font-size:11px;font-weight:500;color:#888;text-transform:uppercase;lett
     <input type="file" id="xlsx-input" accept=".xlsx" style="display:none" onchange="importXlsx(this)">
     <button class="export-btn" onclick="exportNowTasks()">Export “now” tasks</button>
     <button class="export-btn" id="focus-btn" onclick="toggleFocusMode()">Focus</button>
+    <button class="export-btn" id="next-btn" onclick="toggleNextMode()">Next phase</button>
+    <button class="export-btn" id="later-btn" onclick="toggleLaterMode()">Later</button>
     <button class="export-btn" onclick="forceReset()" style="color:#c0392b;border-color:#c0392b" title="Reload all default data">Reset data</button>
     <button class="export-btn" id="conclude-phase-btn" onclick="concludePhase()">Conclude phase →</button>
     <button class="export-btn" id="reopen-phase-btn" onclick="reopenPhase()" style="display:none">Re-open phase</button>
@@ -1645,7 +1651,15 @@ function renderColNumbers(){
 let showAllTasks=false;
 let showArchived=false;
 let focusMode=false;
+let focusPriority='urgent';
 let _focusDragIdx=null;
+
+/** Config for each focus-style category view. */
+const FOCUS_VIEWS={
+  urgent:{btnId:'focus-btn',off:'Focus',on:'Exit focus',empty:'No urgent tasks in this phase.'},
+  nextphase:{btnId:'next-btn',off:'Next phase',on:'Exit next phase',empty:'No \u201cnext phase\u201d tasks in this phase.'},
+  future:{btnId:'later-btn',off:'Later',on:'Exit later',empty:'No \u201clater\u201d tasks in this phase.'}
+};
 
 function toggleShowAll(){
   showAllTasks=!showAllTasks;
@@ -1660,10 +1674,17 @@ function toggleShowArchived(){
   renderColNumbers();
 }
 
-function toggleFocusMode(){
-  focusMode=!focusMode;
-  const btn=document.getElementById('focus-btn');
-  if(btn) btn.textContent=focusMode?'Exit focus':'Focus';
+function setFocusMode(priority){
+  if(focusMode&&focusPriority===priority){focusMode=false;}
+  else{focusMode=true;focusPriority=priority;}
+  Object.keys(FOCUS_VIEWS).forEach(p=>{
+    const cfg=FOCUS_VIEWS[p];
+    const b=document.getElementById(cfg.btnId);
+    if(!b) return;
+    const active=focusMode&&focusPriority===p;
+    b.textContent=active?cfg.on:cfg.off;
+    b.classList.toggle('mode-active',active);
+  });
   const tbl=document.querySelector('table');
   const atr=document.querySelector('.add-topic-row');
   const fv=document.getElementById('focus-view');
@@ -1672,6 +1693,10 @@ function toggleFocusMode(){
   if(fv) fv.style.display=focusMode?'flex':'none';
   if(focusMode) renderFocusView();
 }
+
+function toggleFocusMode(){setFocusMode('urgent');}
+function toggleNextMode(){setFocusMode('nextphase');}
+function toggleLaterMode(){setFocusMode('future');}
 
 function setTaskPriority(tid,sid,taskId,priority){
   const topic=phases[currentPhase].topics.find(t=>t.id===tid);
@@ -1687,17 +1712,17 @@ function renderFocusView(){
   const container=document.getElementById('focus-view');
   if(!container||!focusMode) return;
   container.innerHTML='';
-  const tasks=getFocusTasks(phases,currentPhase);
+  const tasks=getFocusTasks(phases,currentPhase,focusPriority);
   if(!tasks.length){
     const empty=document.createElement('div');
     empty.style.cssText='font-size:13px;color:#aaa;padding:2rem 0;text-align:center;width:100%';
-    empty.textContent='No urgent tasks in this phase.';
+    empty.textContent=(FOCUS_VIEWS[focusPriority]||FOCUS_VIEWS.urgent).empty;
     container.appendChild(empty);
     return;
   }
   tasks.forEach((task,idx)=>{
     const item=document.createElement('div');
-    item.className='focus-item'+(task.focusUrgent?' focus-item-urgent':'');
+    item.className='focus-item focus-cat-'+focusPriority+(task.focusUrgent?' focus-item-urgent':'');
 
     const handle=document.createElement('span');
     handle.className='focus-drag-handle';
@@ -1760,7 +1785,7 @@ function renderFocusView(){
       if(_focusDragIdx===null||_focusDragIdx===idx) return;
       const rect=item.getBoundingClientRect();
       const after=e.clientY>=rect.top+rect.height/2;
-      phases=reorderFocus(phases,currentPhase,_focusDragIdx,idx,after);
+      phases=reorderFocus(phases,currentPhase,_focusDragIdx,idx,after,focusPriority);
       saveData();
       renderFocusView();
     });
@@ -1901,22 +1926,23 @@ function deletePhase(){
 
 // ── Focus view ───────────────────────────────────────────────────────────────
 
-/** Pure — returns ordered list of urgent non-done tasks for the focus view. */
-function getFocusTasks(phasesData, phaseKey){
+/** Pure — returns ordered list of non-done tasks of `priority` (default 'urgent') for a focus-style view. */
+function getFocusTasks(phasesData, phaseKey, priority){
+  const prio=priority||'urgent';
   const ph=phasesData[phaseKey];
   if(!ph) return [];
   const all=[];
   (ph.topics||[]).filter(t=>!t.archived).forEach(topic=>{
     (topic.subjects||[]).forEach(sub=>{
       (sub.tasks||[]).forEach(task=>{
-        if(!task.done&&task.priority==='urgent')
+        if(!task.done&&task.priority===prio)
           all.push({topicId:topic.id,subjectId:sub.id,taskId:task.id,
             text:task.text,topicName:topic.name,topicColor:topic.color,subjectName:sub.name,
             focusUrgent:!!task.focusUrgent});
       });
     });
   });
-  const order=ph.focusOrder||[];
+  const order=ph[focusOrderKey(prio)]||[];
   const seen=new Set();
   const result=[];
   order.forEach(ref=>{
@@ -1932,18 +1958,26 @@ function getFocusTasks(phasesData, phaseKey){
 }
 window.getFocusTasks=getFocusTasks;
 
-/** Pure — reorders the focus list, updating phase.focusOrder. */
-function reorderFocus(phasesData, phaseKey, fromIdx, toIdx, after){
+/** Pure — key under which a category's manual order is stored on a phase. */
+function focusOrderKey(priority){
+  const prio=priority||'urgent';
+  return prio==='urgent'?'focusOrder':'focusOrder_'+prio;
+}
+window.focusOrderKey=focusOrderKey;
+
+/** Pure — reorders a category's focus list, updating the phase's order array. */
+function reorderFocus(phasesData, phaseKey, fromIdx, toIdx, after, priority){
+  const prio=priority||'urgent';
   const data=JSON.parse(JSON.stringify(phasesData));
   const ph=data[phaseKey];
   if(!ph) return data;
-  const tasks=getFocusTasks(phasesData,phaseKey);
+  const tasks=getFocusTasks(phasesData,phaseKey,prio);
   if(fromIdx<0||fromIdx>=tasks.length||toIdx<0||toIdx>=tasks.length||fromIdx===toIdx) return data;
   const refs=tasks.map(t=>({topicId:t.topicId,subjectId:t.subjectId,taskId:t.taskId}));
   const [moved]=refs.splice(fromIdx,1);
   const adj=fromIdx<toIdx?toIdx-1:toIdx;
   refs.splice(after?adj+1:adj,0,moved);
-  ph.focusOrder=refs;
+  ph[focusOrderKey(prio)]=refs;
   return data;
 }
 window.reorderFocus=reorderFocus;
