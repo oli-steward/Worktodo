@@ -226,12 +226,8 @@ thead th{font-size:11px;font-weight:500;color:#888;text-transform:uppercase;lett
     <button class="export-btn" onclick="backupData()">&#8681; Backup</button>
     <button class="export-btn" onclick="document.getElementById('restore-input').click()">&#8679; Restore</button>
     <input type="file" id="restore-input" accept=".json" style="display:none" onchange="restoreData(this)">
-    <button class="export-btn" onclick="syncFromGSheets()">Sync Google Sheet</button>
     <button class="export-btn" id="show-all-btn" onclick="toggleShowAll()">Show all tasks</button>
     <button class="export-btn" id="show-archived-btn" onclick="toggleShowArchived()" style="display:none">Show archived (0)</button>
-    <button class="export-btn" onclick="document.getElementById('xlsx-input').click()">Import Excel</button>
-    <input type="file" id="xlsx-input" accept=".xlsx" style="display:none" onchange="importXlsx(this)">
-    <button class="export-btn" onclick="exportNowTasks()">Export “now” tasks</button>
     <button class="export-btn" id="focus-btn" onclick="toggleFocusMode()">Focus</button>
     <button class="export-btn" id="next-btn" onclick="toggleNextMode()">Next phase</button>
     <button class="export-btn" id="later-btn" onclick="toggleLaterMode()">Later</button>
