@@ -603,6 +603,10 @@ function toggleFileMenu(e){
   menu.appendChild(sep);
   item('History…','Ctrl+H',false,openHistoryPanel);
   item('Revert to Saved','',false,revertToSaved);
+  const sep2=document.createElement('div');
+  sep2.style.cssText='border-top:0.5px solid #eee;margin:4px 6px';
+  menu.appendChild(sep2);
+  item('Add “now” to Calendar','.ics',collectNowTasks(phases).length===0,exportNowToCalendar);
   document.body.appendChild(menu);
   setTimeout(()=>{document.addEventListener('click',closeFileMenu,{once:true});},0);
 }
@@ -1407,6 +1411,7 @@ function showPopover(e,tid,sid){
       <span style="font-size:12px;flex:1;${t.done?'text-decoration:line-through;color:#999':('color:'+pColor)}">${t.text}</span>
       <span style="font-size:10px;color:${t.priority==='future'?'#E8846A':t.priority==='nextphase'?'#7F77DD':'#aaa'};flex-shrink:0">${t.priority==='urgent'?'now':t.priority==='future'?'later':t.priority==='nextphase'?'next phase':''}</span>
       <div class="popover-actions">
+        <button class="act-btn" title="Add to Google Calendar" onclick="addTaskToGCal(${tid},${sid},${t.id})">Cal</button>
         <button class="act-btn" onclick="startEditTask(${tid},${sid},${t.id},this)">Edit</button>
         <button class="act-btn del" onclick="deleteTask(${tid},${sid},${t.id})">Del</button>
       </div>`;
@@ -1619,6 +1624,111 @@ function exportNowTasks(){
   toast.style.opacity='1';
   clearTimeout(toast._t);
   toast._t=setTimeout(()=>{toast.style.opacity='0';},2000);
+}
+
+// ── Google Calendar ──────────────────────────────────────────────────────────
+// Two paths, no dependencies and no auth:
+//   A) one task  → calendar.google.com template URL (opens Google's event editor)
+//   B) all "now" → a single .ics of VEVENTs (importable into Google/Apple/Outlook)
+// Tasks carry no date, so both default to an all-day event on the current day;
+// the date is adjusted in the calendar, not here.
+
+function _gcalYMD(d){
+  const p=n=>String(n).padStart(2,'0');
+  return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate());
+}
+
+/** Pure — "Phase 4 > Cirka > Platform" trail used as the event description. */
+function gcalContext(phaseLabel,topicName,subjectName){
+  return [phaseLabel,topicName,subjectName].filter(Boolean).join(' > ');
+}
+
+/** Pure — Google Calendar prefilled-event URL for a single all-day task. */
+function gcalTemplateUrl(text,details,date){
+  const start=date||new Date();
+  const end=new Date(start.getTime()+86400000);
+  const q=new URLSearchParams({
+    action:'TEMPLATE',
+    text:text||'',
+    details:details||'',
+    dates:_gcalYMD(start)+'/'+_gcalYMD(end)
+  });
+  return 'https://calendar.google.com/calendar/render?'+q.toString();
+}
+
+function addTaskToGCal(tid,sid,taskId){
+  const ph=phases[currentPhase];
+  const topic=ph&&ph.topics.find(x=>x.id===tid);
+  const sub=topic&&topic.subjects.find(x=>x.id===sid);
+  const t=sub&&sub.tasks.find(x=>x.id===taskId);
+  if(!t) return;
+  const url=gcalTemplateUrl(t.text,gcalContext(ph.label,topic.name,sub.name));
+  window.open(url,'_blank','noopener');
+}
+
+function _icsEsc(s){
+  return String(s==null?'':s).replace(/\\/g,'\\\\').replace(/;/g,'\\;').replace(/,/g,'\\,').replace(/\r?\n/g,'\\n');
+}
+
+/** RFC 5545 line folding — long summaries stay valid on import. */
+function _icsFold(line){
+  if(line.length<=73) return line;
+  let out=line.slice(0,73), rest=line.slice(73);
+  while(rest.length>72){out+='\r\n '+rest.slice(0,72);rest=rest.slice(72);}
+  return out+'\r\n '+rest;
+}
+
+/** Pure — collects open "now" tasks across every phase. */
+function collectNowTasks(phasesData){
+  const out=[];
+  Object.entries(phasesData||phases).forEach(([phaseKey,ph])=>{
+    (ph.topics||[]).forEach(topic=>{
+      (topic.subjects||[]).forEach(sub=>{
+        (sub.tasks||[]).filter(t=>t.priority==='urgent'&&!t.done).forEach(t=>{
+          out.push({phaseKey,phase:ph.label,topic:topic.name,topicId:topic.id,subject:sub.name,subjectId:sub.id,taskId:t.id,text:t.text});
+        });
+      });
+    });
+  });
+  return out;
+}
+
+/** Pure — VCALENDAR of all-day VEVENTs. Stable UIDs, so re-importing updates
+ *  the existing events instead of duplicating them. */
+function buildNowCalendarIcs(tasks,date){
+  const day=date||new Date();
+  const start=_gcalYMD(day);
+  const end=_gcalYMD(new Date(day.getTime()+86400000));
+  const stamp=new Date().toISOString().replace(/[-:.]/g,'').slice(0,15)+'Z';
+  const CRLF='\r\n';
+  let ics='BEGIN:VCALENDAR'+CRLF+'VERSION:2.0'+CRLF+'PRODID:-//OS Projects//EN'+CRLF+'CALSCALE:GREGORIAN'+CRLF+'METHOD:PUBLISH'+CRLF;
+  tasks.forEach(t=>{
+    ics+='BEGIN:VEVENT'+CRLF;
+    ics+='UID:'+[t.phaseKey,t.topicId,t.subjectId,t.taskId].join('-')+'@os-projects'+CRLF;
+    ics+='DTSTAMP:'+stamp+CRLF;
+    ics+='DTSTART;VALUE=DATE:'+start+CRLF;
+    ics+='DTEND;VALUE=DATE:'+end+CRLF;
+    ics+=_icsFold('SUMMARY:'+_icsEsc(t.text))+CRLF;
+    ics+=_icsFold('DESCRIPTION:'+_icsEsc(gcalContext(t.phase,t.topic,t.subject)))+CRLF;
+    ics+='TRANSP:TRANSPARENT'+CRLF;
+    ics+='END:VEVENT'+CRLF;
+  });
+  return ics+'END:VCALENDAR';
+}
+
+function exportNowToCalendar(){
+  const tasks=collectNowTasks(phases);
+  if(tasks.length===0){alert("No tasks marked as 'now' found across all phases.");return;}
+  const blob=new Blob([buildNowCalendarIcs(tasks)],{type:'text/calendar;charset=utf-8'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url;a.download='os-projects-now-calendar.ics';a.click();
+  URL.revokeObjectURL(url);
+  const toast=document.getElementById('export-toast');
+  if(toast){
+    toast.textContent=tasks.length+' event'+(tasks.length===1?'':'s')+' saved!';toast.style.opacity='1';
+    clearTimeout(toast._t);toast._t=setTimeout(()=>{toast.style.opacity='0';toast.textContent='Downloaded!';},2500);
+  }
 }
 
 function forceReset(){
