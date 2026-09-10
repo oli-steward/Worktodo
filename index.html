@@ -1426,7 +1426,10 @@ function showPopover(e,tid,sid){
   pop.appendChild(addRow);
   pop.style.display='flex';
   document.getElementById('popover-wrap').style.display='block';
-  if(e.target&&e.target!==document.body&&e.target.isConnected){
+  if(_popPos&&_popPosKey===tid+':'+sid){
+    // keep a moved window where the user put it across re-renders
+    _popApplyPos();
+  } else if(e.target&&e.target!==document.body&&e.target.isConnected){
     const rect=e.target.getBoundingClientRect();
     if(rect.width>0||rect.height>0){
       pop.style.top=(rect.bottom+window.scrollY+4)+'px';
@@ -1529,8 +1532,95 @@ function commitPopoverTask(tid,sid){
   showPopover({target:document.body},tid,sid);
 }
 
+// ── Movable popover window ───────────────────────────────────────────────────
+// The "+" window can be dragged by any empty area (labels, padding — not rows,
+// buttons or inputs) and nudged with the arrow keys: 1px a press, 10px with
+// Shift, 100px with Alt. Position survives the popover's own re-renders and
+// resets when it closes.
+
+let _popPos=null,_popPosKey=null,_popDrag=null;
+
+function _popClamp(left,top){
+  const pop=document.getElementById('popover');
+  const w=pop.offsetWidth,h=pop.offsetHeight;
+  const minL=window.scrollX+4,maxL=window.scrollX+window.innerWidth-w-4;
+  const minT=window.scrollY+4,maxT=window.scrollY+window.innerHeight-Math.min(h,window.innerHeight-8)-4;
+  return {left:Math.min(Math.max(left,minL),Math.max(minL,maxL)),
+          top:Math.min(Math.max(top,minT),Math.max(minT,maxT))};
+}
+
+function _popApplyPos(){
+  if(!_popPos) return;
+  const pop=document.getElementById('popover');
+  // !important so a moved window also wins over the narrow-screen left rule
+  pop.style.setProperty('left',_popPos.left+'px','important');
+  pop.style.setProperty('top',_popPos.top+'px','important');
+}
+
+/** Moves the open popover by a pixel delta and remembers where it landed. */
+function _popMoveBy(dx,dy){
+  const pop=document.getElementById('popover');
+  if(!pop||pop.style.display==='none'||!openPopover) return;
+  const base=_popPos||{left:parseFloat(pop.style.left)||0,top:parseFloat(pop.style.top)||0};
+  _popPos=_popClamp(base.left+dx,base.top+dy);
+  _popPosKey=openPopover.tid+':'+openPopover.sid;
+  _popApplyPos();
+}
+
+function _popDragStart(ev){
+  const pop=document.getElementById('popover');
+  if(!pop||pop.style.display==='none'||!openPopover) return;
+  if(ev.button) return;
+  if(ev.target.closest('button,input,textarea,select,.popover-task,.act-btn')) return;
+  const r=pop.getBoundingClientRect();
+  _popDrag={dx:ev.clientX-r.left,dy:ev.clientY-r.top,moved:false};
+  pop.style.cursor='grabbing';
+  pop.style.touchAction='none';
+  document.body.style.userSelect='none';
+  document.addEventListener('pointermove',_popDragMove);
+  document.addEventListener('pointerup',_popDragEnd,{once:true});
+  ev.preventDefault();
+}
+
+function _popDragMove(ev){
+  if(!_popDrag) return;
+  _popDrag.moved=true;
+  _popPos=_popClamp(ev.clientX-_popDrag.dx+window.scrollX,ev.clientY-_popDrag.dy+window.scrollY);
+  _popPosKey=openPopover?openPopover.tid+':'+openPopover.sid:null;
+  _popApplyPos();
+}
+
+function _popDragEnd(){
+  const pop=document.getElementById('popover');
+  const moved=_popDrag&&_popDrag.moved;
+  _popDrag=null;
+  document.removeEventListener('pointermove',_popDragMove);
+  if(pop){pop.style.cursor='';pop.style.touchAction='';}
+  document.body.style.userSelect='';
+  // a drag that ends over the backdrop must not count as a click-to-close
+  if(moved) document.addEventListener('click',e=>{e.stopPropagation();},{capture:true,once:true});
+}
+
+document.getElementById('popover').addEventListener('pointerdown',_popDragStart);
+
+document.addEventListener('keydown',(ev)=>{
+  const pop=document.getElementById('popover');
+  if(!openPopover||!pop||pop.style.display==='none') return;
+  const step=ev.altKey?100:ev.shiftKey?10:1;
+  const delta={ArrowLeft:[-step,0],ArrowRight:[step,0],ArrowUp:[0,-step],ArrowDown:[0,step]}[ev.key];
+  if(!delta) return;
+  // arrows keep working inside the popover's own text fields while they're empty
+  const t=ev.target;
+  if(t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA')&&t.value!=='') return;
+  ev.preventDefault();
+  _popMoveBy(delta[0],delta[1]);
+});
+
 function closePopover(){
-  document.getElementById('popover').style.display='none';
+  _popPos=null;_popPosKey=null;
+  const _pop=document.getElementById('popover');
+  _pop.style.removeProperty('left');_pop.style.removeProperty('top');
+  _pop.style.display='none';
   document.getElementById('popover-wrap').style.display='none';
   openPopover=null;
 }
