@@ -378,7 +378,22 @@ function loadData(){
       const hasData=Object.keys(defaultData).some(k=>
         parsed[k]&&parsed[k].topics&&parsed[k].topics.length>0
       );
-      if(hasData) return parsed;
+      if(hasData){
+        // One-shot schema normalisation (see gcalMigrateSchema below). Guarded
+        // on its own so a migration failure can never stop the app loading, and
+        // written with literals rather than the GCAL_* consts — those sit far
+        // below in the file and are still in their temporal dead zone here.
+        // The key is stamped only when something actually changed: stamping
+        // unconditionally would be a localStorage write on first load even with
+        // sync disabled, and a store with nothing to migrate can simply re-walk
+        // its tasks each load — idempotent and cheaper than the write it avoids.
+        try{
+          if(localStorage.getItem('os_projects_schema')!=='1'){
+            if(gcalMigrateSchema(parsed).changed>0) localStorage.setItem('os_projects_schema','1');
+          }
+        }catch(e){}
+        return parsed;
+      }
     }
   }catch(e){}
   return resetToDefault();
@@ -1630,6 +1645,9 @@ function toggleTask(tid,sid,taskId){
   const s=t&&t.subjects.find(x=>x.id===sid);
   const tk=s&&s.tasks.find(x=>x.id===taskId);
   if(tk) tk.done=!tk.done;
+  // Fire-and-forget: the calendar round trip must never delay the local save
+  // or the re-render, and it persists itself (see gcalSyncTask).
+  if(tk&&gcalSyncEnabled()) gcalSyncTask(currentPhase,tid,sid,taskId,tk.done?'complete':'reopen');
   saveData();
   renderTable();
 }
@@ -1819,6 +1837,200 @@ function exportNowToCalendar(){
     toast.textContent=tasks.length+' event'+(tasks.length===1?'':'s')+' saved!';toast.style.opacity='1';
     clearTimeout(toast._t);toast._t=setTimeout(()=>{toast.style.opacity='0';toast.textContent='Downloaded!';},2500);
   }
+}
+
+// ── Google Calendar · task status sync ───────────────────────────────────────
+// Optional one-way push of task completion to a real Calendar event through an
+// Apps Script Web App. There is no UI: ticking a task is the trigger.
+// An empty GCAL_SYNC_URL disables the feature entirely — no fetch, no queue,
+// no console output — which is the shipped default. Every path here is
+// fire-and-forget and swallows its own errors: a calendar hiccup must never
+// block saveData() or renderTable().
+
+const GCAL_SYNC_URL      = '';          // Apps Script deployment URL; '' disables sync
+const GCAL_SYNC_TOKEN    = '';          // shared token, must match Code.gs
+const GCAL_SYNC_CALENDAR = 'primary';
+const GCAL_QUEUE_KEY     = 'os_projects_gcal_queue';
+const GCAL_QUEUE_LIMIT   = 50;
+
+/** Pure — the identity buildNowCalendarIcs() already mints, so an .ics import
+ *  and an API-synced event land on the same event instead of duplicating it. */
+function gcalTaskUid(phaseKey,topicId,subjectId,taskId){
+  return [phaseKey,topicId,subjectId,taskId].join('-');
+}
+
+/** Pure — the single kill switch both call-sites are guarded by. */
+function gcalSyncEnabled(){
+  return typeof GCAL_SYNC_URL==='string'&&GCAL_SYNC_URL!=='';
+}
+
+/** Pure — request body. `link` is omitted entirely when the task has never
+ *  synced: its absence is how the backend knows to insert rather than patch. */
+function gcalBuildPayload(op,ctx){
+  const c=ctx||{};
+  const task={uid:c.uid,text:c.text,context:c.context};
+  if(c.date) task.date=c.date;
+  const payload={v:1,token:GCAL_SYNC_TOKEN,ts:Date.now(),op:op,task:task};
+  if(c.link&&c.link.eventId) payload.link={eventId:c.link.eventId,calendarId:c.link.calendarId||GCAL_SYNC_CALENDAR};
+  return payload;
+}
+
+/** Pure — folds a response into the task's link record. NOT_FOUND means the
+ *  event was deleted in Calendar, so the link is dropped rather than kept:
+ *  the next sync then re-creates the event instead of patching a ghost. */
+function gcalApplyResult(task,result){
+  if(!task) return task;
+  const r=result||{};
+  if(r.ok){
+    task.gcal={
+      eventId:r.eventId,
+      calendarId:r.calendarId||GCAL_SYNC_CALENDAR,
+      syncedAt:r.syncedAt||new Date().toISOString(),
+      status:r.status||'open'
+    };
+  }else if(r.code==='NOT_FOUND'){
+    task.gcal=null;
+  }
+  return task;
+}
+
+/** Pure — retryable is exactly {NOT_FOUND, CALENDAR_ERROR}; a null code stands
+ *  for a network failure, which is retryable too. Everything else (bad token,
+ *  stale timestamp, malformed body) would fail identically forever. */
+function gcalIsRetryable(codeOrNull){
+  return codeOrNull==null||codeOrNull==='NOT_FOUND'||codeOrNull==='CALENDAR_ERROR';
+}
+
+/** Pure — new array, oldest evicted first. Capped because the queue lives in
+ *  localStorage: an indefinite backlog would eventually blow the quota. */
+function gcalQueuePush(queue,payload,limit){
+  const cap=typeof limit==='number'&&limit>0?limit:GCAL_QUEUE_LIMIT;
+  const next=(Array.isArray(queue)?queue:[]).concat([payload]);
+  return next.length>cap?next.slice(next.length-cap):next;
+}
+
+// localStorage throws in private mode, so both accessors are fully guarded and
+// a failure degrades to "no queue" rather than propagating to the caller.
+function _gcalQueueRead(){
+  try{
+    const raw=localStorage.getItem(GCAL_QUEUE_KEY);
+    const q=raw?JSON.parse(raw):[];
+    return Array.isArray(q)?q:[];
+  }catch(e){return [];}
+}
+function _gcalQueueWrite(queue){
+  try{localStorage.setItem(GCAL_QUEUE_KEY,JSON.stringify(queue||[]));}catch(e){}
+}
+
+/** Simple request only: 'application/json' would trigger a CORS preflight that
+ *  Apps Script Web Apps never answer, and the 302 they reply with has to be
+ *  followed. Never throws — every failure comes back as CALENDAR_ERROR. */
+async function gcalPost(payload){
+  try{
+    const res=await fetch(GCAL_SYNC_URL,{
+      method:'POST',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify(payload),
+      redirect:'follow'
+    });
+    const parsed=JSON.parse(await res.text());
+    return parsed&&typeof parsed==='object'?parsed:{ok:false,code:'CALENDAR_ERROR'};
+  }catch(e){
+    return {ok:false,code:'CALENDAR_ERROR'};
+  }
+}
+
+/** Resolves the task fresh — the user may have edited during the round trip —
+ *  posts, then folds the result back in. Persists through localStorage only,
+ *  never saveData(): resolving asynchronously, saveData() would push a stale
+ *  phases snapshot to Supabase and add a non-user entry to the undo history.
+ *  The next real user action carries the link onward. Never throws. */
+async function gcalSyncTask(phaseKey,tid,sid,taskId,op){
+  if(!gcalSyncEnabled()) return;
+  try{
+    const ph=phases&&phases[phaseKey];
+    const topic=ph&&(ph.topics||[]).find(x=>x.id===tid);
+    const sub=topic&&(topic.subjects||[]).find(x=>x.id===sid);
+    const tk=sub&&(sub.tasks||[]).find(x=>x.id===taskId);
+    if(!tk) return;
+    const payload=gcalBuildPayload(op,{
+      uid:gcalTaskUid(phaseKey,tid,sid,taskId),
+      text:tk.text,
+      context:gcalContext(ph.label,topic.name,sub.name),
+      link:tk.gcal
+    });
+    const result=await gcalPost(payload);
+    const code=result&&result.ok?null:((result&&result.code)||'CALENDAR_ERROR');
+    gcalApplyResult(tk,result);
+    // Only a success or a NOT_FOUND changes task.gcal; nothing else is worth a write.
+    if(!code||code==='NOT_FOUND'){
+      try{localStorage.setItem(LS_KEY,JSON.stringify(phases));}catch(e){}
+    }
+    if(!code) return;
+    if(!gcalIsRetryable(code)) return;              // permanent failure — drop it
+    // The link was just cleared, so a retry must not carry the dead event id.
+    if(code==='NOT_FOUND') delete payload.link;
+    _gcalQueueWrite(gcalQueuePush(_gcalQueueRead(),payload,GCAL_QUEUE_LIMIT));
+  }catch(e){}
+}
+
+/** Best-effort drain on boot. Entries that fail again are kept in order so a
+ *  transient outage does not lose completions; permanently failing ones are
+ *  dropped rather than retried forever. Never throws. */
+async function gcalFlushQueue(){
+  if(!gcalSyncEnabled()) return;
+  try{
+    const queue=_gcalQueueRead();
+    if(queue.length===0) return;                    // nothing queued — no write at all
+    const keep=[];
+    for(const payload of queue){
+      // Refresh ts: the backend's ±5 minute replay window would reject a
+      // timestamp minted in the session that failed.
+      const p=Object.assign({},payload,{ts:Date.now()});
+      const result=await gcalPost(p);
+      if(result&&result.ok) continue;
+      if(gcalIsRetryable((result&&result.code)||'CALENDAR_ERROR')) keep.push(p);
+    }
+    _gcalQueueWrite(keep);
+  }catch(e){}
+}
+
+/** Pure-ish — migrates `phasesData` in place to schema 1: legacy flat
+ *  task.gcalEventId / task.gcalCalendarId become the nested task.gcal record,
+ *  and any link that lost its eventId becomes null. Touches nothing else.
+ *  Deterministic on purpose (no clock, no config reads) so migrations/
+ *  001-gcal-links.js can mirror it byte-for-byte. Idempotent: the second run
+ *  reports changed:0. Returns {phases, changed}. */
+function gcalMigrateSchema(phasesData){
+  let changed=0;
+  const data=phasesData||{};
+  Object.keys(data).forEach(phaseKey=>{
+    const ph=data[phaseKey];
+    ((ph&&ph.topics)||[]).forEach(topic=>{
+      ((topic&&topic.subjects)||[]).forEach(sub=>{
+        ((sub&&sub.tasks)||[]).forEach(task=>{
+          if(!task||typeof task!=='object') return;
+          let touched=false;
+          if(task.gcalEventId){
+            task.gcal={
+              eventId:task.gcalEventId,
+              calendarId:task.gcalCalendarId||'primary',
+              // No timestamp is invented: the legacy shape never carried one,
+              // and Date.now() here would make the two copies disagree.
+              syncedAt:(task.gcal&&task.gcal.syncedAt)||null,
+              status:task.done?'done':'open'
+            };
+            touched=true;
+          }
+          if('gcalEventId' in task){delete task.gcalEventId;touched=true;}
+          if('gcalCalendarId' in task){delete task.gcalCalendarId;touched=true;}
+          if(task.gcal&&!task.gcal.eventId){task.gcal=null;touched=true;}
+          if(touched) changed++;
+        });
+      });
+    });
+  });
+  return {phases:data,changed:changed};
 }
 
 function forceReset(){
@@ -2725,6 +2937,9 @@ window.addEventListener('scroll',saveScrollPos,{passive:true});
   renderTable();
   renderColNumbers();
   requestAnimationFrame(()=>requestAnimationFrame(restoreScrollPos));
+  // Retry completions stranded by an earlier failure. Not awaited: a dead
+  // backend must not hold up first paint.
+  if(gcalSyncEnabled()) gcalFlushQueue();
 })();
 </script>
 <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
