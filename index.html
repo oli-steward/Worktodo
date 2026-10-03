@@ -1317,7 +1317,9 @@ function renderTable(){
       addBtn.className='add-chip';
       addBtn.textContent='+ add';
       addBtn.onclick=(e)=>{e.stopPropagation();showPopover(e,topic.id,sub.id);};
-      wrap.appendChild(addBtn);
+      // Leads the row: the add affordance sits at a fixed left edge across every
+      // subject, instead of drifting rightwards with the task count.
+      wrap.insertBefore(addBtn,wrap.firstChild);
       tasksTd.appendChild(wrap);
       tr.appendChild(tasksTd);
       tbody.appendChild(tr);
@@ -1364,7 +1366,9 @@ function applyOverflow(){
         badge.className='overflow-badge';
         badge.textContent=`+${hidden} more`;
         badge.onclick=(e)=>{e.stopPropagation();showPopover(e,topic.id,sub.id);};
-        wrap.insertBefore(badge,addBtn);
+        // The add button now leads the row, so the badge trails the chips
+        // instead of sitting in front of it.
+        wrap.appendChild(badge);
       }
     });
   });
@@ -1437,7 +1441,7 @@ function showPopover(e,tid,sid){
 
   const addRow=document.createElement('div');
   addRow.className='popover-add';
-  addRow.innerHTML=`<button onclick="commitPopoverTask(${tid},${sid})">Add</button><input id="pop-inp" placeholder="New task..." />`;
+  addRow.innerHTML=`<input id="pop-inp" placeholder="New task..." /><button onclick="commitPopoverTask(${tid},${sid})">Add</button>`;
   pop.appendChild(addRow);
   pop.style.display='flex';
   document.getElementById('popover-wrap').style.display='block';
