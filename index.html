@@ -1437,7 +1437,7 @@ function showPopover(e,tid,sid){
 
   const addRow=document.createElement('div');
   addRow.className='popover-add';
-  addRow.innerHTML=`<input id="pop-inp" placeholder="New task..." /><button onclick="commitPopoverTask(${tid},${sid})">Add</button>`;
+  addRow.innerHTML=`<button onclick="commitPopoverTask(${tid},${sid})">Add</button><input id="pop-inp" placeholder="New task..." />`;
   pop.appendChild(addRow);
   pop.style.display='flex';
   document.getElementById('popover-wrap').style.display='block';
