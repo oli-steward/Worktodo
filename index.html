@@ -51,6 +51,8 @@ thead th{font-size:11px;font-weight:500;color:#888;text-transform:uppercase;lett
 .goal-pill{font-size:10px;padding:2px 7px;border-radius:6px;background:#E6F1FB;color:#0C447C;white-space:nowrap;display:inline-block;margin-left:4px}
 .add-chip{flex-shrink:0;display:flex;align-items:center;padding:3px 8px;border-radius:6px;border:0.5px dashed #ccc;font-size:12px;color:#999;cursor:pointer;white-space:nowrap}
 .add-chip:hover{background:#f5f5f5;color:#1a1a1a}
+.chip-cal{margin-left:auto;align-self:flex-start;flex-shrink:0;font-size:9px;line-height:1;padding:1px 3px;border:0.5px solid #e0e0e0;border-radius:3px;color:#bbb;letter-spacing:.02em}
+.chip-cal.concluded{text-decoration:line-through;color:#ccc}
 .sep-row td{height:3px;background:#1a1a1a;padding:0}
 .add-topic-row{display:flex;gap:8px;margin-top:10px;align-items:center}
 .add-topic-row input{font-size:12px;padding:5px 9px;border-radius:6px;border:0.5px solid #ccc;background:#fff;color:#1a1a1a}
@@ -1274,7 +1276,13 @@ function renderTable(){
         const chip=document.createElement('div');
         const pClass=(t.done||sub.concluded)?' done':t.priority==='urgent'?' urgent':t.priority==='future'?' future':t.priority==='nextphase'?' nextphase':'';
         chip.className='task-chip'+pClass;
-        chip.innerHTML=`<span class="task-drag-handle" title="Drag to reorder">⠿</span><div class="chip-check"></div><span class="chip-label">${t.text}</span>`;
+        // Calendar link marker. Driven by task.gcal.status — what Calendar last
+        // confirmed — not by t.done, so a completion that failed or is still
+        // queued shows a ticked task whose event is visibly still open.
+        const calTag=(t.gcal&&t.gcal.eventId)
+          ?`<span class="chip-cal${t.gcal.status==='done'?' concluded':''}" title="${t.gcal.status==='done'?'Calendar event concluded':'Calendar event open'}">cal</span>`
+          :'';
+        chip.innerHTML=`<span class="task-drag-handle" title="Drag to reorder">⠿</span><div class="chip-check"></div><span class="chip-label">${t.text}</span>${calTag}`;
         chip.onclick=(e)=>{if(e.target.closest('.task-drag-handle')) return; toggleTask(topic.id,sub.id,t.id);};
         chip.oncontextmenu=(e)=>{e.preventDefault();cyclePriority(topic.id,sub.id,t.id);};
         chip.title='Right-click to cycle priority: none → now → next phase → later';
@@ -1863,6 +1871,14 @@ function gcalTaskUid(phaseKey,topicId,subjectId,taskId){
   return [phaseKey,topicId,subjectId,taskId].join('-');
 }
 
+/** Pure — the event title: "Topic: task text", matching how the events are
+ *  named by hand in Calendar. A task with no topic keeps its bare text. */
+function gcalEventTitle(topicName,taskText){
+  const t=topicName==null?'':String(topicName).trim();
+  const x=taskText==null?'':String(taskText);
+  return t?t+': '+x:x;
+}
+
 /** Pure — the single kill switch both call-sites are guarded by. */
 function gcalSyncEnabled(){
   return typeof GCAL_SYNC_URL==='string'&&GCAL_SYNC_URL!=='';
@@ -1959,7 +1975,7 @@ async function gcalSyncTask(phaseKey,tid,sid,taskId,op){
     if(!tk) return;
     const payload=gcalBuildPayload(op,{
       uid:gcalTaskUid(phaseKey,tid,sid,taskId),
-      text:tk.text,
+      text:gcalEventTitle(topic.name,tk.text),
       context:gcalContext(ph.label,topic.name,sub.name),
       link:tk.gcal
     });
