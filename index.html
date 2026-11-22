@@ -159,6 +159,7 @@ thead th{font-size:11px;font-weight:500;color:#888;text-transform:uppercase;lett
 .subj-check-badge::after{content:'';display:block;width:3px;height:5px;border:1.5px solid #fff;border-top:none;border-left:none;transform:rotate(45deg) translateY(-1px)}
 .act-btn.conclude{color:#1D9E75;border-color:#a8dcc8}
 .act-btn.reopen{color:#bbb;border-color:#ddd}
+.act-btn.subj-move{font-family:inherit;max-width:104px}
 
 /* ── Phase rail ───────────────────────────────────────────────────────────── */
 .phase-rail{display:flex;gap:6px;margin-bottom:1.25rem;max-width:60%}
@@ -269,6 +270,15 @@ const COLORS=['#1D9E75','#378ADD','#D4537E','#BA7517','#7F77DD','#D85A30','#6399
 const LS_KEY='os_projects_data';
 const LS_SCROLL_KEY='os_projects_scroll';
 const LS_PHASE_KEY='os_projects_phase';
+// Stamp of the remote row this browser last wrote or loaded. saveData has
+// always written updated_at; nothing ever read it, so the boot load replaced
+// local data unconditionally and silently dropped edits made offline, or made
+// inside the 300ms save debounce before a tab close.
+const LS_SYNCED_KEY='os_projects_synced_at';
+// Set the moment anything changes, cleared only by a confirmed remote write.
+// Surer than comparing clocks: it also covers a remote row written before
+// updated_at existed, and an unload that cut the final upsert off mid-flight.
+const LS_DIRTY_KEY='os_projects_dirty';
 const SUPABASE_URL='https://dzksworkkpbnghsxqskk.supabase.co';
 const SUPABASE_KEY='eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR6a3N3b3Jra3Bibmdoc3hxc2trIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzcxMzEwMjYsImV4cCI6MjA5MjcwNzAyNn0.19b41BwAewSsUCQcxOU1JVqT_b76b0ZrS9-EtccmAIw';
 const sb=supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
@@ -372,15 +382,38 @@ const defaultData={
   ]}
 };
 
+/** Pure — does this store hold anything worth keeping?
+ *
+ *  Keyed to the STORE's own phase names, never defaultData's. Probing
+ *  Object.keys(defaultData) meant a store whose phases were all PH6+ (conclude
+ *  a phase, then delete PH2-PH5 — all reachable from the UI) read as empty, and
+ *  loadData/loadFromSupabase then replaced every task with the factory
+ *  defaults. restoreData already probed it this way. */
+/** saveData without the undo step.
+ *
+ *  saveData is wrapped by the history recorder, so calling it from an async
+ *  calendar reply added an undo entry for a link the user never typed — and,
+ *  worse, cleared the redo stack from under them, since any new branch
+ *  invalidates redo. The original code avoided saveData here for exactly that
+ *  reason and paid for it by never pushing the link remotely; this keeps the
+ *  remote write and drops the history step. */
+function saveDataQuiet(){
+  const prev=_histSuspend;
+  _histSuspend=true;
+  try{ saveData(); } finally { _histSuspend=prev; }
+}
+
+function phasesHaveData(obj){
+  if(!obj||typeof obj!=='object') return false;
+  return Object.keys(obj).some(k=>obj[k]&&Array.isArray(obj[k].topics)&&obj[k].topics.length>0);
+}
+
 function loadData(){
   try{
     const saved=localStorage.getItem(LS_KEY);
     if(saved){
       const parsed=JSON.parse(saved);
-      const hasData=Object.keys(defaultData).some(k=>
-        parsed[k]&&parsed[k].topics&&parsed[k].topics.length>0
-      );
-      if(hasData){
+      if(phasesHaveData(parsed)){
         // One-shot schema normalisation (see gcalMigrateSchema below). Guarded
         // on its own so a migration failure can never stop the app loading, and
         // written with literals rather than the GCAL_* consts — those sit far
@@ -412,22 +445,44 @@ let phases=loadData();
 function saveData(){
   // localStorage stays synchronous: data survives a tab close even if the
   // debounced remote write has not fired yet.
-  try{localStorage.setItem(LS_KEY,JSON.stringify(phases));}catch(e){}
+  try{
+    localStorage.setItem(LS_KEY,JSON.stringify(phases));
+    localStorage.setItem(LS_DIRTY_KEY,'1');
+  }catch(e){}
   const ind=document.getElementById('save-indicator');
   if(ind){ind.textContent='Saving...';ind.style.opacity='1';}
   // Debounced: coalesces rapid mutations into a single Supabase upsert.
   clearTimeout(_sbSaveTimer);
-  _sbSaveTimer=setTimeout(()=>{
-    sb.from('os_projects').upsert({id:DEVICE_ID,data:JSON.stringify(phases),updated_at:new Date().toISOString()})
-      .then(({error})=>{
-        if(!ind) return;
-        if(error){ind.textContent='Saved locally';console.warn('Supabase save error:',error);}
-        else ind.textContent='Synced';
-        clearTimeout(ind._t);
-        ind._t=setTimeout(()=>{ind.style.opacity='0';},1500);
-      });
-  },300);
+  _sbSaveTimer=setTimeout(_sbFlush,300);
 }
+
+/** The debounced remote write, pulled out of saveData so pagehide can force it. */
+function _sbFlush(){
+  clearTimeout(_sbSaveTimer);
+  _sbSaveTimer=null;
+  const ind=document.getElementById('save-indicator');
+  const stamp=new Date().toISOString();
+  return sb.from('os_projects').upsert({id:DEVICE_ID,data:JSON.stringify(phases),updated_at:stamp})
+    .then(({error})=>{
+      if(!error){try{
+        localStorage.setItem(LS_SYNCED_KEY,stamp);
+        localStorage.removeItem(LS_DIRTY_KEY);
+      }catch(e){}}
+      if(!ind) return;
+      if(error){ind.textContent='Saved locally';console.warn('Supabase save error:',error);}
+      else ind.textContent='Synced';
+      clearTimeout(ind._t);
+      ind._t=setTimeout(()=>{ind.style.opacity='0';},1500);
+    });
+}
+
+// A tab closed inside the debounce used to lose its last edit. pagehide is the
+// one lifecycle event that fires reliably on mobile; visibilitychange covers
+// the backgrounding that precedes it.
+window.addEventListener('pagehide',()=>{if(_sbSaveTimer) _sbFlush();});
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='hidden'&&_sbSaveTimer) _sbFlush();
+});
 
 // ── Undo / Redo / History ────────────────────────────────────────────────────
 // One wrapper around saveData() records every mutation as a JSON snapshot, so
@@ -546,14 +601,12 @@ function _histApply(entry){
     // keep LS_PHASE_KEY in step with the restored phase; guarded so a failure here
     // can never trigger the rollback path below.
     try{ if(typeof saveCurrentPhase==="function") saveCurrentPhase(); }catch(e){}
-    renderTabs(); renderTable(); renderColNumbers();
-    return true;
+    renderTabs(); renderTable();    return true;
   }catch(err){
     console.error('History: could not apply snapshot, rolling back.',err);
     try{
       phases=JSON.parse(_prevJson); currentPhase=_prevPhase;
-      renderTabs(); renderTable(); renderColNumbers();
-    }catch(e2){ console.error('History: rollback also failed.',e2); }
+      renderTabs(); renderTable();    }catch(e2){ console.error('History: rollback also failed.',e2); }
     return false;
   }finally{ _histSuspend=false; }
 }
@@ -779,13 +832,47 @@ async function loadFromSupabase(){
     // Race the query against a 2s timeout: without this a hung connection
     // blocks the startup IIFE forever and the page never renders.
     const timeout=new Promise((_,rej)=>setTimeout(()=>rej(new Error('Supabase load timeout')),2000));
-    const query=sb.from('os_projects').select('data').eq('id',DEVICE_ID).single();
+    const query=sb.from('os_projects').select('data,updated_at').eq('id',DEVICE_ID).single();
     const {data,error}=await Promise.race([query,timeout]);
     if(error||!data) return null;
     const parsed=JSON.parse(data.data);
-    const hasData=Object.keys(defaultData).some(k=>parsed[k]&&parsed[k].topics&&parsed[k].topics.length>0);
-    return hasData?parsed:null;
+    if(!phasesHaveData(parsed)) return null;
+    return {phases:parsed,updatedAt:data.updated_at||null};
   }catch(e){return null;}
+}
+
+/** Pure — is the remote row newer than what this browser last synced?
+ *
+ *  Unknown on either side means yes: a first visit, a cleared browser or a row
+ *  written before this field existed should all load the remote copy. Only a
+ *  stamp this browser recorded itself, strictly newer than the row's, keeps
+ *  local — which is exactly the offline-edit and closed-tab case. */
+function remoteIsNewer(remoteStamp,localStamp){
+  const local=localStamp!==undefined?localStamp:(()=>{try{return localStorage.getItem(LS_SYNCED_KEY);}catch(e){return null;}})();
+  if(!local||!remoteStamp) return true;
+  const r=Date.parse(remoteStamp),l=Date.parse(local);
+  if(!Number.isFinite(r)||!Number.isFinite(l)) return true;
+  return r>=l;
+}
+
+/** currentPhase must name a phase that exists: renderTable reads
+ *  phases[currentPhase].topics unguarded and blanks the table if it does not.
+ *  Call after every wholesale `phases=` assignment. */
+function ensureCurrentPhase(){
+  if(phases&&phases[currentPhase]) return currentPhase;
+  const first=getSortedPhaseKeys(phases)[0];
+  if(first){currentPhase=first;saveCurrentPhase();}
+  return currentPhase;
+}
+
+/** Pure — HTML-escape a value for interpolation into innerHTML.
+ *
+ *  Task, topic and subject names are user input and reach innerHTML in a dozen
+ *  places. Unescaped, a name like `Fix <div> tag` silently lost its `<div>`,
+ *  and markup in a name taken from the shared Supabase row or an imported
+ *  backup executed on load. Output is byte-identical for ordinary text. */
+function esc(v){
+  return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 function allTasks(ph){return phases[ph].topics.flatMap(t=>t.subjects.flatMap(s=>s.tasks))}
@@ -1137,7 +1224,8 @@ function renderMetrics(){
 function renderTable(){
   const tbody=document.getElementById('tbody');
   tbody.innerHTML='';
-  const ph=phases[currentPhase];
+  const ph=phases[ensureCurrentPhase()];
+  if(!ph) return;              // no phases at all — nothing to draw, do not throw
   const archivedCount=ph.topics.filter(t=>t.archived).length;
   const archBtn=document.getElementById('show-archived-btn');
   if(archBtn){
@@ -1175,7 +1263,7 @@ function renderTable(){
         topicTd.rowSpan=topic.subjects.length;
         const topicTotal=topic.subjects.flatMap(s=>s.tasks).length;
         const topicDone=topic.subjects.flatMap(s=>s.tasks).filter(t=>t.done).length;
-        topicTd.innerHTML=`<div class="topic-label"><span class="drag-handle" title="Drag to reorder">&#8597;</span><div class="topic-dot" style="background:${topic.color}"></div><span class="topic-name">${topic.name}</span></div><div style="font-size:10px;color:#aaa;margin-top:2px;padding-left:14px">${topicDone}/${topicTotal}</div>`;
+        topicTd.innerHTML=`<div class="topic-label"><span class="drag-handle" title="Drag to reorder">&#8597;</span><div class="topic-dot" style="background:${esc(topic.color)}"></div><span class="topic-name">${esc(topic.name)}</span></div><div style="font-size:10px;color:#aaa;margin-top:2px;padding-left:14px">${topicDone}/${topicTotal}</div>`;
         topicTd.draggable=true;
         topicTd.dataset.tid=topic.id;
         topicTd.addEventListener('dragstart',(e)=>{
@@ -1188,7 +1276,11 @@ function renderTable(){
           document.querySelectorAll('.drag-over-top,.drag-over-bottom').forEach(el=>el.classList.remove('drag-over-top','drag-over-bottom'));
         });
         topicTd.addEventListener('dragover',(e)=>{
-          if(_dragSubjectInfo) return;
+          // Only a topic drag may reorder topics. Accepting anything else let a
+          // dropped task chip — or a text selection — reach the drop handler,
+          // where a NaN id spliced out the LAST topic.
+          if(_dragSubjectInfo||_dragTaskInfo) return;
+          if(e.dataTransfer&&e.dataTransfer.types&&!Array.from(e.dataTransfer.types).includes('tid')) return;
           e.preventDefault();
           document.querySelectorAll('.drag-over-top,.drag-over-bottom').forEach(el=>el.classList.remove('drag-over-top','drag-over-bottom'));
           const rect=topicTd.getBoundingClientRect();
@@ -1201,9 +1293,10 @@ function renderTable(){
           e.preventDefault();
           const fromId=parseInt(e.dataTransfer.getData('tid'));
           const toId=topic.id;
-          if(fromId===toId) return;
+          if(!Number.isFinite(fromId)||fromId===toId) return;
           const ph=phases[currentPhase];
           const fromIdx=ph.topics.findIndex(t=>t.id===fromId);
+          if(fromIdx<0) return;   // splice(-1,1) would move the last topic instead
           const toIdx=ph.topics.findIndex(t=>t.id===toId);
           const rect=topicTd.getBoundingClientRect();
           const mid=rect.top+rect.height/2;
@@ -1213,7 +1306,6 @@ function renderTable(){
           ph.topics.splice(after?newIdx+1:newIdx,0,moved);
           saveData();
           renderTable();
-          renderColNumbers();
         });
         tr.appendChild(topicTd);
       }
@@ -1224,7 +1316,7 @@ function renderTable(){
       const countStr=subTotal>0?` <span style="font-size:10px;color:#aaa">${subDone}/${subTotal}</span>`:'';
       const concludedBadge=sub.concluded?`<span class="subj-check-badge"></span>`:'';
       const concludedClass=sub.concluded?' class="subj-concluded"':'';
-      subjTd.innerHTML=concludedBadge+`<span${concludedClass}>${sub.name}</span>`+countStr+(sub.goal?`<span class="goal-pill">${sub.goal}</span>`:'');
+      subjTd.innerHTML=concludedBadge+`<span${concludedClass}>${esc(sub.name)}</span>`+countStr+(sub.goal?`<span class="goal-pill">${esc(sub.goal)}</span>`:'');
       const subjHandle=document.createElement('span');
       subjHandle.className='subj-drag-handle';
       subjHandle.title='Drag to reorder';
@@ -1263,8 +1355,7 @@ function renderTable(){
         const rect=tr.getBoundingClientRect();
         const after=e.clientY>=rect.top+rect.height/2;
         phases=moveSubject(phases,currentPhase,topic.id,fromIdx,si,after);
-        saveData();renderTable();renderColNumbers();
-      });
+        saveData();renderTable();      });
       tr.appendChild(subjTd);
 
       const tasksTd=document.createElement('td');
@@ -1272,7 +1363,9 @@ function renderTable(){
       const wrap=document.createElement('div');
       wrap.className='tasks-inline';
       wrap.id=`row-${topic.id}-${sub.id}`;
-      (showAllTasks||sub.concluded?sub.tasks:sub.tasks.filter(t=>!t.done)).slice(0,showAllTasks?undefined:3).forEach(t=>{
+      const rowTasks=(showAllTasks||sub.concluded?sub.tasks:sub.tasks.filter(t=>!t.done));
+      wrap.dataset.total=rowTasks.length;   // applyOverflow counts against this, not the slice
+      rowTasks.slice(0,showAllTasks?undefined:3).forEach(t=>{
         const chip=document.createElement('div');
         const pClass=(t.done||sub.concluded)?' done':t.priority==='urgent'?' urgent':t.priority==='future'?' future':t.priority==='nextphase'?' nextphase':'';
         chip.className='task-chip'+pClass;
@@ -1282,7 +1375,7 @@ function renderTable(){
         const calTag=(t.gcal&&t.gcal.eventId)
           ?`<span class="chip-cal${t.gcal.status==='done'?' concluded':''}" title="${t.gcal.status==='done'?'Calendar event concluded':'Calendar event open'}">cal</span>`
           :'';
-        chip.innerHTML=`<span class="task-drag-handle" title="Drag to reorder">⠿</span><div class="chip-check"></div><span class="chip-label">${t.text}</span>${calTag}`;
+        chip.innerHTML=`<span class="task-drag-handle" title="Drag to reorder">⠿</span><div class="chip-check"></div><span class="chip-label">${esc(t.text)}</span>${calTag}`;
         chip.onclick=(e)=>{if(e.target.closest('.task-drag-handle')) return; toggleTask(topic.id,sub.id,t.id);};
         chip.oncontextmenu=(e)=>{e.preventDefault();cyclePriority(topic.id,sub.id,t.id);};
         chip.title='Right-click to cycle priority: none → now → next phase → later';
@@ -1317,8 +1410,7 @@ function renderTable(){
           const rect=chip.getBoundingClientRect();
           const after=e.clientX>=rect.left+rect.width/2;
           phases=moveTask(phases,currentPhase,topic.id,sub.id,fromIdx,realIdx,after);
-          saveData();renderTable();renderColNumbers();
-        });
+          saveData();renderTable();        });
         wrap.appendChild(chip);
       });
       const addBtn=document.createElement('div');
@@ -1347,12 +1439,19 @@ function renderTable(){
 }
 
 function applyOverflow(){
-  if(showAllTasks) return;
+  // Focus mode hides the table, so every offsetWidth reads 0 and containerW
+  // goes negative — the old code then hid every chip behind a "+N more" badge
+  // and nothing re-measured on the way out.
+  if(showAllTasks||focusMode) return;
   const ph=phases[currentPhase];
+  if(!ph) return;
   ph.topics.forEach(topic=>{
     topic.subjects.forEach(sub=>{
       const wrap=document.getElementById(`row-${topic.id}-${sub.id}`);
       if(!wrap) return;
+      // The row was already sliced to 3 chips before rendering, so counting
+      // only hidden chips reported "+1 more" for a subject with ten tasks left.
+      const rowTotal=Number(wrap.dataset.total||0);
       const chips=Array.from(wrap.querySelectorAll('.task-chip'));
       const addBtn=wrap.querySelector('.add-chip');
       const existing=wrap.querySelector('.overflow-badge');
@@ -1367,9 +1466,11 @@ function applyOverflow(){
         if(usedW+cw+(i<chips.length-1?BADGE_W:0)>containerW){firstHiddenIdx=i;break;}
         usedW+=cw;
       }
-      if(firstHiddenIdx>=0){
-        const hidden=chips.length-firstHiddenIdx;
-        for(let i=firstHiddenIdx;i<chips.length;i++) chips[i].style.display='none';
+      const visible=firstHiddenIdx>=0?firstHiddenIdx:chips.length;
+      const hiddenTotal=Math.max(rowTotal-visible,0);
+      if(firstHiddenIdx>=0||hiddenTotal>0){
+        const hidden=hiddenTotal||(chips.length-firstHiddenIdx);
+        if(firstHiddenIdx>=0){for(let i=firstHiddenIdx;i<chips.length;i++) chips[i].style.display='none';}
         const badge=document.createElement('div');
         badge.className='overflow-badge';
         badge.textContent=`+${hidden} more`;
@@ -1395,8 +1496,8 @@ function showPopover(e,tid,sid){
   topicRow.style.cssText='padding:4px 6px 6px;border-bottom:0.5px solid #eee;margin-bottom:2px';
   topicRow.innerHTML=`<div style="font-size:11px;color:#aaa;margin-bottom:4px">Topic</div>
     <div style="display:flex;align-items:center;gap:6px">
-      <div style="width:8px;height:8px;border-radius:50%;background:${topic.color};flex-shrink:0"></div>
-      <span id="topic-name-display" style="font-size:13px;font-weight:500;flex:1">${topic.name}</span>
+      <div style="width:8px;height:8px;border-radius:50%;background:${esc(topic.color)};flex-shrink:0"></div>
+      <span id="topic-name-display" style="font-size:13px;font-weight:500;flex:1">${esc(topic.name)}</span>
       <button class="act-btn" onclick="startEditTopic(${tid},${sid})">Edit</button>
       <button class="act-btn" onclick="toggleArchiveTopic(${tid})">${topic.archived?'Unarchive':'Archive'}</button>
       <button class="act-btn del" onclick="deleteTopic(${tid})">Delete</button>
@@ -1415,9 +1516,24 @@ function showPopover(e,tid,sid){
       ?`<button class="act-btn reopen" onclick="toggleConcludeSubject(${tid},${s.id})">Reopen</button>`
       :`<button class="act-btn conclude" onclick="toggleConcludeSubject(${tid},${s.id})">Conclude</button>`;
     const nameStyle=s.concluded?'text-decoration:line-through;color:#bbb':'';
+    // Destinations are the other topics of this phase. Disabled rather than
+    // hidden when there is nowhere to go, so the row keeps its shape and the
+    // title says why.
+    const others=topic.subjects.length<=1
+      ?[]
+      :phases[currentPhase].topics.filter(x=>x.id!==tid);
+    const moveTitle=topic.subjects.length<=1
+      ?'A topic must have at least one subject'
+      :(others.length?'Move this subject to another topic':'No other topic in this phase');
+    const moveSel=`<select class="act-btn subj-move" title="${moveTitle}" ${others.length?'':'disabled'}
+        onchange="transferSubjectTo(${tid},${s.id},this.value)">
+        <option value="">Move to...</option>
+        ${others.map(x=>`<option value="${Number(x.id)}">${esc(x.name)}</option>`).join('')}
+      </select>`;
     sRow.innerHTML=`${s.concluded?'<span class="subj-check-badge"></span>':''}
-      <span id="subj-name-${tid}-${s.id}" style="font-size:12px;flex:1;${nameStyle}">${s.name}</span>
+      <span id="subj-name-${tid}-${s.id}" style="font-size:12px;flex:1;${nameStyle}">${esc(s.name)}</span>
       <button id="subj-edit-btn-${tid}-${s.id}" class="act-btn" onclick="startEditSubject(${tid},${s.id})">Edit</button>
+      ${moveSel}
       ${concludeBtn}
       <button class="act-btn del" onclick="deleteSubject(${tid},${s.id})">Del</button>`;
     subjSection.appendChild(sRow);
@@ -1435,7 +1551,7 @@ function showPopover(e,tid,sid){
     row.className='popover-task';
     const pColor=t.priority==='urgent'?'#1a1a1a':t.priority==='future'?'#E8846A':t.priority==='nextphase'?'#7F77DD':'#1a1a1a';
     row.innerHTML=`<div style="width:14px;height:14px;border-radius:50%;border:1.5px solid #ccc;flex-shrink:0;display:flex;align-items:center;justify-content:center;${t.done?'background:#1D9E75;border-color:#1D9E75':''}"></div>
-      <span style="font-size:12px;flex:1;${t.done?'text-decoration:line-through;color:#999':('color:'+pColor)}">${t.text}</span>
+      <span style="font-size:12px;flex:1;${t.done?'text-decoration:line-through;color:#999':('color:'+pColor)}">${esc(t.text)}</span>
       <span style="font-size:10px;color:${t.priority==='future'?'#E8846A':t.priority==='nextphase'?'#7F77DD':'#aaa'};flex-shrink:0">${t.priority==='urgent'?'now':t.priority==='future'?'later':t.priority==='nextphase'?'next phase':''}</span>
       <div class="popover-actions">
         <button class="act-btn" title="Add to Google Calendar" onclick="addTaskToGCal(${tid},${sid},${t.id})">Cal</button>
@@ -1449,7 +1565,9 @@ function showPopover(e,tid,sid){
 
   const addRow=document.createElement('div');
   addRow.className='popover-add';
-  addRow.innerHTML=`<input id="pop-inp" placeholder="New task..." /><button onclick="commitPopoverTask(${tid},${sid})">Add</button>`;
+  // Enter commits. The global keydown handler skips INPUT targets, so without
+  // this the only way to add a task was the button.
+  addRow.innerHTML=`<input id="pop-inp" placeholder="New task..." onkeydown="if(event.key==='Enter'){event.preventDefault();commitPopoverTask(${tid},${sid});}" /><button onclick="commitPopoverTask(${tid},${sid})">Add</button>`;
   pop.appendChild(addRow);
   pop.style.display='flex';
   document.getElementById('popover-wrap').style.display='block';
@@ -1493,6 +1611,7 @@ function deleteTask(tid,sid,taskId){
   const topic=phases[currentPhase].topics.find(x=>x.id===tid);
   const sub=topic&&topic.subjects.find(x=>x.id===sid);
   if(!sub) return;
+  gcalReleaseTasks(currentPhase,tid,sid,sub.tasks.filter(x=>x.id===taskId));
   sub.tasks=sub.tasks.filter(x=>x.id!==taskId);
   saveData();renderTable();
   showPopover({target:document.body},tid,sid);
@@ -1516,6 +1635,8 @@ function startEditTopic(tid,sid){
 
 function deleteTopic(tid){
   if(!confirm('Delete this topic and all its tasks?')) return;
+  const going=phases[currentPhase].topics.find(x=>x.id===tid);
+  if(going) (going.subjects||[]).forEach(sb=>gcalReleaseTasks(currentPhase,tid,sb.id,sb.tasks));
   phases[currentPhase].topics=phases[currentPhase].topics.filter(x=>x.id!==tid);
   saveData();renderTable();closePopover();
 }
@@ -1544,7 +1665,7 @@ function toggleArchiveTopic(tid){
   const topic=phases[currentPhase].topics.find(t=>t.id===tid);
   if(!topic) return;
   phases=topic.archived?unarchiveTopic(phases,currentPhase,tid):archiveTopic(phases,currentPhase,tid);
-  saveData();renderTable();renderColNumbers();closePopover();
+  saveData();renderTable();closePopover();
 }
 
 function commitPopoverTask(tid,sid){
@@ -1693,59 +1814,6 @@ function addTopic(){
   renderTable();
 }
 
-function exportNowTasks(){
-  const allNow=[];
-  Object.entries(phases).forEach(([phaseKey,ph])=>{
-    ph.topics.forEach(topic=>{
-      topic.subjects.forEach(sub=>{
-        sub.tasks.filter(t=>t.priority==='urgent'&&!t.done).forEach(t=>{
-          allNow.push({text:t.text,topic:topic.name,subject:sub.name,phase:ph.label});
-        });
-      });
-    });
-  });
-
-  if(allNow.length===0){
-    alert("No tasks marked as 'now' found across all phases.");
-    return;
-  }
-
-  const now=new Date();
-  const stamp=now.toISOString().replace(/[-:.]/g,'').slice(0,15)+'Z';
-  const due=new Date(now);
-  due.setDate(due.getDate()+14);
-  const dueStr=due.toISOString().slice(0,10).replace(/-/g,'');
-
-  const CRLF='\r\n';
-  let ics='BEGIN:VCALENDAR'+CRLF+'VERSION:2.0'+CRLF+'PRODID:-//OS Projects//EN'+CRLF+'CALSCALE:GREGORIAN'+CRLF;
-  allNow.forEach((t,i)=>{
-    const uid='osprojekt-'+stamp+'-'+i+'@osprojects';
-    ics+='BEGIN:VTODO'+CRLF;
-    ics+='UID:'+uid+CRLF;
-    ics+='DTSTAMP:'+stamp+CRLF;
-    ics+='SUMMARY:'+t.text+CRLF;
-    ics+='DESCRIPTION:'+t.phase+' > '+t.topic+' > '+t.subject+CRLF;
-    ics+='DUE;VALUE=DATE:'+dueStr+CRLF;
-    ics+='PRIORITY:1'+CRLF;
-    ics+='STATUS:NEEDS-ACTION'+CRLF;
-    ics+='END:VTODO'+CRLF;
-  });
-  ics+='END:VCALENDAR';
-
-  const blob=new Blob([ics],{type:'text/calendar;charset=utf-8'});
-  const url=URL.createObjectURL(blob);
-  const a=document.createElement('a');
-  a.href=url;
-  a.download='os-projects-now-tasks.ics';
-  a.click();
-  URL.revokeObjectURL(url);
-
-  const toast=document.getElementById('export-toast');
-  toast.style.opacity='1';
-  clearTimeout(toast._t);
-  toast._t=setTimeout(()=>{toast.style.opacity='0';},2000);
-}
-
 // ── Google Calendar ──────────────────────────────────────────────────────────
 // Two paths, no dependencies and no auth:
 //   A) one task  → calendar.google.com template URL (opens Google's event editor)
@@ -1790,6 +1858,13 @@ function addTaskToGCal(tid,sid,taskId){
   const sub=topic&&topic.subjects.find(x=>x.id===sid);
   const t=sub&&sub.tasks.find(x=>x.id===taskId);
   if(!t) return;
+  if(gcalSyncEnabled()){
+    // Through the backend the app learns the event id, so the task gets a real
+    // link and a "cal" chip tag. The template URL below cannot: Google saves the
+    // event in its own editor and tells this page nothing.
+    gcalSyncTask(currentPhase,tid,sid,taskId,t.done?'complete':'upsert');
+    return;
+  }
   const url=gcalTemplateUrl(gcalEventTitle(topic.name,t.text),gcalContext(ph.label,topic.name,sub.name));
   window.open(url,'_blank','noopener');
 }
@@ -1800,10 +1875,19 @@ function _icsEsc(s){
 
 /** RFC 5545 line folding — long summaries stay valid on import. */
 function _icsFold(line){
-  if(line.length<=73) return line;
-  let out=line.slice(0,73), rest=line.slice(73);
-  while(rest.length>72){out+='\r\n '+rest.slice(0,72);rest=rest.slice(72);}
-  return out+'\r\n '+rest;
+  // RFC 5545 counts OCTETS, not characters. Folding on length pushed German and
+  // French text past the limit, and a fold landing inside an emoji left a lone
+  // surrogate. Array.from keeps surrogate pairs whole.
+  const enc=new TextEncoder();
+  const out=[];
+  let cur='',curBytes=0,limit=73;
+  for(const ch of Array.from(line)){
+    const b=enc.encode(ch).length;
+    if(curBytes+b>limit){out.push(cur);cur=ch;curBytes=b;limit=72;}
+    else{cur+=ch;curBytes+=b;}
+  }
+  out.push(cur);
+  return out.join('\r\n ');
 }
 
 /** Pure — collects open "now" tasks across every phase. */
@@ -1872,6 +1956,8 @@ const GCAL_SYNC_TOKEN    = 'osw-7f3a91c4de62b508a1';          // shared token, m
 const GCAL_SYNC_CALENDAR = 'primary';
 const GCAL_QUEUE_KEY     = 'os_projects_gcal_queue';
 const GCAL_QUEUE_LIMIT   = 50;
+const _gcalInFlight=new Set();   // uids with a request in the air; never persisted
+const _gcalPendingOp=new Map();  // uid -> op asked for while one was in flight
 
 /** Pure — the identity buildNowCalendarIcs() already mints, so an .ics import
  *  and an API-synced event land on the same event instead of duplicating it. */
@@ -1914,6 +2000,35 @@ function gcalApplyResult(task,result){
   return task;
 }
 
+/** Pure — the inverse of gcalTaskUid(). The phase key is whatever precedes the
+ *  three trailing ids, so a key containing a dash would still parse. */
+function gcalParseTaskUid(uid){
+  const parts=String(uid==null?'':uid).split('-');
+  if(parts.length<4) return null;
+  const taskId=Number(parts.pop()),subjectId=Number(parts.pop()),topicId=Number(parts.pop());
+  const phaseKey=parts.join('-');
+  if(!phaseKey||![taskId,subjectId,topicId].every(n=>Number.isFinite(n))) return null;
+  return {phaseKey,topicId,subjectId,taskId};
+}
+
+/** Pure — resolves a uid back to its live task object, or null when the task has
+ *  since been deleted or moved (a move remints the uid). */
+function gcalTaskFromUid(phasesData,uid){
+  const ref=gcalParseTaskUid(uid);
+  if(!ref) return null;
+  const ph=phasesData&&phasesData[ref.phaseKey];
+  const topic=ph&&(ph.topics||[]).find(x=>x.id===ref.topicId);
+  const sub=topic&&(topic.subjects||[]).find(x=>x.id===ref.subjectId);
+  const tk=sub&&(sub.tasks||[]).find(x=>x.id===ref.taskId);
+  return tk||null;
+}
+
+/** Pure — the chip tag only redraws when the link actually changed. */
+function gcalLinkSig(task){
+  const g=task&&task.gcal;
+  return g?(g.eventId||'')+':'+(g.status||''):'';
+}
+
 /** Pure — retryable is exactly {NOT_FOUND, CALENDAR_ERROR}; a null code stands
  *  for a network failure, which is retryable too. Everything else (bad token,
  *  stale timestamp, malformed body) would fail identically forever. */
@@ -1923,10 +2038,20 @@ function gcalIsRetryable(codeOrNull){
 
 /** Pure — new array, oldest evicted first. Capped because the queue lives in
  *  localStorage: an indefinite backlog would eventually blow the quota. */
+function gcalQueueUid(payload){
+  return payload&&payload.task&&payload.task.uid!=null?String(payload.task.uid):'';
+}
+
 function gcalQueuePush(queue,payload,limit){
-  const cap=typeof limit==='number'&&limit>0?limit:GCAL_QUEUE_LIMIT;
-  const next=(Array.isArray(queue)?queue:[]).concat([payload]);
-  return next.length>cap?next.slice(next.length-cap):next;
+  const cap=Number.isFinite(limit)&&limit>0?limit:GCAL_QUEUE_LIMIT;
+  // One entry per task. A queued 'complete' that is later undone used to sit in
+  // the queue and be replayed on the next load, re-marking the event done while
+  // the task itself was open — the chip tag then reported a state Calendar did
+  // not have. The newest op for a uid is the only one worth sending.
+  const uid=gcalQueueUid(payload);
+  const kept=uid?(queue||[]).filter(p=>gcalQueueUid(p)!==uid):(queue||[]).slice();
+  const out=kept.concat([payload]);
+  return out.length>cap?out.slice(out.length-cap):out;
 }
 
 // localStorage throws in private mode, so both accessors are fully guarded and
@@ -1967,24 +2092,50 @@ async function gcalPost(payload){
  *  The next real user action carries the link onward. Never throws. */
 async function gcalSyncTask(phaseKey,tid,sid,taskId,op){
   if(!gcalSyncEnabled()) return;
+  const uid=gcalTaskUid(phaseKey,tid,sid,taskId);
+  let owned=false;
   try{
     const ph=phases&&phases[phaseKey];
     const topic=ph&&(ph.topics||[]).find(x=>x.id===tid);
     const sub=topic&&(topic.subjects||[]).find(x=>x.id===sid);
     const tk=sub&&(sub.tasks||[]).find(x=>x.id===taskId);
     if(!tk) return;
+    // One request per task at a time. Two quick toggles, or a double-click on
+    // Cal, both read tk.gcal as absent and both posted without a link — which
+    // is exactly how the backend is told to INSERT, so each created its own
+    // event. Both maps are transient and deliberately never persisted.
+    //
+    // The later op is REMEMBERED, not dropped: simply returning meant ticking
+    // and immediately unticking sent only the complete, leaving the task open
+    // and its event concluded for good.
+    if(_gcalInFlight.has(uid)){_gcalPendingOp.set(uid,op);return;}
+    _gcalInFlight.add(uid);
+    owned=true;
     const payload=gcalBuildPayload(op,{
-      uid:gcalTaskUid(phaseKey,tid,sid,taskId),
+      uid:uid,
       text:gcalEventTitle(topic.name,tk.text),
       context:gcalContext(ph.label,topic.name,sub.name),
       link:tk.gcal
     });
     const result=await gcalPost(payload);
     const code=result&&result.ok?null:((result&&result.code)||'CALENDAR_ERROR');
-    gcalApplyResult(tk,result);
-    // Only a success or a NOT_FOUND changes task.gcal; nothing else is worth a write.
-    if(!code||code==='NOT_FOUND'){
-      try{localStorage.setItem(LS_KEY,JSON.stringify(phases));}catch(e){}
+    // Re-resolve after the await. `tk` was found before it, and undo, moveTask,
+    // transferSubject, archive and a phase transition all replace `phases`
+    // wholesale — applying the result to the old object left the event orphaned
+    // in Calendar and the live tree with no link.
+    const live=gcalTaskFromUid(phases,uid);
+    if(live){
+      const before=gcalLinkSig(live);
+      gcalApplyResult(live,result);
+      // Only a success or a NOT_FOUND changes task.gcal; nothing else is worth a write.
+      if((!code||code==='NOT_FOUND')&&gcalLinkSig(live)!==before){
+        // Persist remotely too. localStorage alone meant the link was erased by
+        // the next boot, and the following toggle posted without it — a second
+        // event. Quiet: a calendar reply is not a user action and must not
+        // occupy an undo step or wipe the redo stack.
+        saveDataQuiet();
+        try{renderTable();}catch(e){}
+      }
     }
     if(!code) return;
     if(!gcalIsRetryable(code)) return;              // permanent failure — drop it
@@ -1992,6 +2143,18 @@ async function gcalSyncTask(phaseKey,tid,sid,taskId,op){
     if(code==='NOT_FOUND') delete payload.link;
     _gcalQueueWrite(gcalQueuePush(_gcalQueueRead(),payload,GCAL_QUEUE_LIMIT));
   }catch(e){}
+  finally{
+    // Only the call that claimed the slot releases it, otherwise the early
+    // return above would consume its own deferred op and recurse forever.
+    if(owned){
+      _gcalInFlight.delete(uid);
+      const next=_gcalPendingOp.get(uid);
+      if(next!==undefined){
+        _gcalPendingOp.delete(uid);
+        gcalSyncTask(phaseKey,tid,sid,taskId,next);
+      }
+    }
+  }
 }
 
 /** Best-effort drain on boot. Entries that fail again are kept in order so a
@@ -2003,15 +2166,48 @@ async function gcalFlushQueue(){
     const queue=_gcalQueueRead();
     if(queue.length===0) return;                    // nothing queued — no write at all
     const keep=[];
+    const seen=[];
+    let linked=false;
     for(const payload of queue){
+      const uid=gcalQueueUid(payload);
+      seen.push(uid);
+      // Resolve BEFORE posting. A uid whose task was deleted, or moved (which
+      // remints it), used to be sent anyway and created an event nothing in the
+      // app pointed at.
+      const target=gcalTaskFromUid(phases,uid);
+      if(!target) continue;
       // Refresh ts: the backend's ±5 minute replay window would reject a
       // timestamp minted in the session that failed.
       const p=Object.assign({},payload,{ts:Date.now()});
       const result=await gcalPost(p);
-      if(result&&result.ok) continue;
+      if(result&&result.ok){
+        // Re-resolve: the tree may have been replaced during the await.
+        const tk=gcalTaskFromUid(phases,uid)||target;
+        const before=gcalLinkSig(tk);
+        gcalApplyResult(tk,result);
+        if(gcalLinkSig(tk)!==before) linked=true;
+        continue;
+      }
       if(gcalIsRetryable((result&&result.code)||'CALENDAR_ERROR')) keep.push(p);
     }
-    _gcalQueueWrite(keep);
+    // Re-read before writing. The old code wrote `keep` over whatever landed
+    // during the awaits, silently dropping a completion queued mid-flush.
+    const now=_gcalQueueRead();
+    const merged=now.filter(p=>seen.indexOf(gcalQueueUid(p))<0).concat(keep);
+    // Collapse by uid, newest wins — the same invariant gcalQueuePush keeps.
+    // Two tabs flushing at once can otherwise leave a uid queued twice.
+    const byUid=new Map();
+    const out=[];
+    merged.forEach(p=>{
+      const u=gcalQueueUid(p);
+      if(!u){out.push(p);return;}
+      if(byUid.has(u)) out[byUid.get(u)]=p; else {byUid.set(u,out.length);out.push(p);}
+    });
+    _gcalQueueWrite(out);
+    if(linked){
+      saveDataQuiet();
+      try{renderTable();}catch(e){}
+    }
   }catch(e){}
 }
 
@@ -2056,24 +2252,11 @@ function gcalMigrateSchema(phasesData){
 function forceReset(){
   if(!confirm('This will reload all default topics and tasks. Continue?')) return;
   phases=resetToDefault();
+  ensureCurrentPhase();   // the defaults may not contain the phase we were on
   _histSetLabel('Reset data');
   saveData();   // push the reset remotely, otherwise Supabase keeps the old data
   renderTabs();
   renderTable();
-}
-
-function renderColNumbers(){
-  const container=document.getElementById('col-numbers');
-  if(!container) return;
-  container.innerHTML='';
-  const maxTasks=showAllTasks?Math.max(0,...phases[currentPhase].topics.map(t=>Math.max(0,...t.subjects.map(s=>s.tasks.filter(tk=>!tk.done).length)))):3;
-  for(let i=1;i<=maxTasks;i++){
-    const cell=document.createElement('div');
-    const colW=window.innerWidth<=768?140:window.innerWidth<=480?120:200;
-    cell.style.cssText=`width:${colW}px;flex-shrink:0;font-size:10px;color:#bbb;text-align:center;border-right:1px solid #ccc;padding:1px 0`;
-    cell.textContent=i;
-    container.appendChild(cell);
-  }
 }
 
 let showAllTasks=false;
@@ -2093,13 +2276,11 @@ function toggleShowAll(){
   showAllTasks=!showAllTasks;
   document.getElementById('show-all-btn').textContent=showAllTasks?'Show 3 columns':'Show all tasks';
   renderTable();
-  renderColNumbers();
 }
 
 function toggleShowArchived(){
   showArchived=!showArchived;
   renderTable();
-  renderColNumbers();
 }
 
 function setFocusMode(priority){
@@ -2120,6 +2301,7 @@ function setFocusMode(priority){
   if(atr) atr.style.display=focusMode?'none':'';
   if(fv) fv.style.display=focusMode?'flex':'none';
   if(focusMode) renderFocusView();
+  else requestAnimationFrame(applyOverflow);   // re-measure the rows that were hidden
 }
 
 function toggleFocusMode(){setFocusMode('urgent');}
@@ -2172,7 +2354,7 @@ function renderFocusView(){
     textDiv.textContent=task.text;
     const metaDiv=document.createElement('div');
     metaDiv.style.cssText='display:flex;align-items:center;gap:4px;margin-top:2px';
-    metaDiv.innerHTML=`<div style="width:6px;height:6px;border-radius:50%;background:${task.topicColor};flex-shrink:0"></div><span style="font-size:11px;color:#aaa">${task.topicName} · ${task.subjectName}</span>`;
+    metaDiv.innerHTML=`<div style="width:6px;height:6px;border-radius:50%;background:${esc(task.topicColor)};flex-shrink:0"></div><span style="font-size:11px;color:#aaa">${esc(task.topicName)} · ${esc(task.subjectName)}</span>`;
     content.appendChild(textDiv);
     content.appendChild(metaDiv);
     item.appendChild(content);
@@ -2262,6 +2444,8 @@ function deleteSubject(tid,sid){
   const topic=phases[currentPhase].topics.find(x=>x.id===tid);
   if(!topic||topic.subjects.length<=1){alert('A topic must have at least one subject.');return;}
   if(!confirm('Delete this subject and all its tasks?')) return;
+  const goingSub=topic.subjects.find(x=>x.id===sid);
+  if(goingSub) gcalReleaseTasks(currentPhase,tid,sid,goingSub.tasks);
   topic.subjects=topic.subjects.filter(x=>x.id!==sid);
   saveData();renderTable();
   showPopover({target:document.body},tid,topic.subjects[0].id);
@@ -2288,15 +2472,26 @@ function restoreData(input){
     try{
       const payload=JSON.parse(e.target.result);
       if(!payload.phases) throw new Error('Invalid backup file');
-      const hasData=Object.keys(payload.phases).some(k=>payload.phases[k]&&payload.phases[k].topics&&payload.phases[k].topics.length>0);
-      if(!hasData) throw new Error('Backup appears empty');
+      if(!phasesHaveData(payload.phases)) throw new Error('Backup appears empty');
       if(!confirm(`Restore backup from ${payload.timestamp||'unknown date'}? This will overwrite all current data.`)) return;
-      phases=payload.phases;
+      // Render BEFORE saving. The old order persisted and pushed the payload
+      // first, so a backup the render could not draw was already written to
+      // localStorage and Supabase by the time the catch showed "Restore
+      // failed" — a dialog that lied about what had happened.
+      const previous=phases;
+      try{
+        phases=payload.phases;
+        ensureCurrentPhase();
+        renderTabs();
+        renderTable();
+      }catch(renderErr){
+        phases=previous;
+        ensureCurrentPhase();
+        renderTabs();renderTable();
+        throw new Error('backup could not be rendered, nothing was changed ('+renderErr.message+')');
+      }
       _histSetLabel('Restore backup');
       saveData();
-      renderTabs();
-      renderTable();
-      renderColNumbers();
       const toast=document.getElementById('export-toast');
       toast.textContent='Restored!';toast.style.opacity='1';
       clearTimeout(toast._t);toast._t=setTimeout(()=>{toast.style.opacity='0';toast.textContent='Downloaded!';},2000);
@@ -2320,7 +2515,7 @@ function toggleConcludeSubject(tid,sid){
 
 function saveCurrentPhase(){try{localStorage.setItem(LS_PHASE_KEY,currentPhase);}catch(e){}}
 window.saveCurrentPhase=saveCurrentPhase;
-function setPhase(p){currentPhase=p;showAllGoals=false;saveCurrentPhase();closePopover();renderTabs();renderTable();renderColNumbers();}
+function setPhase(p){currentPhase=p;showAllGoals=false;saveCurrentPhase();closePopover();renderTabs();renderTable();}
 
 // ── Re-open phase ────────────────────────────────────────────────────────────
 
@@ -2335,21 +2530,23 @@ function reopenPhase(){
 // ── Delete phase ─────────────────────────────────────────────────────────────
 
 function deletePhase(){
-  const keys=Object.keys(phases);
+  // Sorted, not insertion order: the tabs are sorted, so taking the neighbour
+  // from Object.keys sent you to a phase nowhere near the one you deleted
+  // (deleting the first tab landed on the last).
+  const keys=getSortedPhaseKeys(phases);
   if(keys.length<=1){alert('Cannot delete the only remaining phase.');return;}
   const ph=phases[currentPhase];
   if(!confirm(`Delete "${ph.label}" and all its topics and tasks? This cannot be undone.`)) return;
   const idx=keys.indexOf(currentPhase);
   delete phases[currentPhase];
   // switch to adjacent phase: prefer previous, fall back to next
-  const remaining=Object.keys(phases);
-  currentPhase=remaining[Math.min(idx,remaining.length-1)];
+  const remaining=getSortedPhaseKeys(phases);
+  currentPhase=remaining[Math.max(0,Math.min(idx-1,remaining.length-1))];
   saveCurrentPhase();
   _histSetLabel('Delete phase');
   saveData();
   renderTabs();
   renderTable();
-  renderColNumbers();
 }
 
 // ── Focus view ───────────────────────────────────────────────────────────────
@@ -2361,7 +2558,9 @@ function getFocusTasks(phasesData, phaseKey, priority){
   if(!ph) return [];
   const all=[];
   (ph.topics||[]).filter(t=>!t.archived).forEach(topic=>{
-    (topic.subjects||[]).forEach(sub=>{
+    // The table renders a concluded subject's tasks struck through; Focus used
+    // to list the same tasks as outstanding work.
+    (topic.subjects||[]).filter(sub=>!sub.concluded).forEach(sub=>{
       (sub.tasks||[]).forEach(task=>{
         if(!task.done&&task.priority===prio)
           all.push({topicId:topic.id,subjectId:sub.id,taskId:task.id,
@@ -2426,6 +2625,64 @@ window.toggleFocusUrgent=toggleFocusUrgent;
 // ── Task reorder ─────────────────────────────────────────────────────────────
 
 /** Pure — moves a subject within a topic's subjects array. Returns new phasesData. */
+/** Pure — deep-copy of phasesData with one subject moved to another topic in
+ *  the same phase. The source topic must keep at least one subject, matching
+ *  deleteSubject(); the subject keeps its id unless the destination already
+ *  uses it. Returns the input unchanged when the move is not allowed. */
+function transferSubject(phasesData,phaseKey,fromTopicId,subjectId,toTopicId){
+  const data=JSON.parse(JSON.stringify(phasesData));
+  if(fromTopicId===toTopicId) return data;
+  const ph=data[phaseKey];if(!ph) return data;
+  const from=(ph.topics||[]).find(t=>t.id===fromTopicId);
+  const to=(ph.topics||[]).find(t=>t.id===toTopicId);
+  if(!from||!to) return data;
+  const idx=(from.subjects||[]).findIndex(x=>x.id===subjectId);
+  if(idx<0) return data;
+  if(from.subjects.length<=1) return data;      // a topic without subjects vanishes from the table
+  const [moved]=from.subjects.splice(idx,1);
+  if((to.subjects||[]).some(x=>x.id===moved.id)){
+    // Subject ids are minted from a global max, so this should not happen — but a
+    // collision would make two subjects indistinguishable to every id lookup.
+    const maxSid=Object.keys(data).reduce((m,k)=>(data[k].topics||[]).reduce((m2,t)=>(t.subjects||[]).reduce((m3,x)=>Math.max(m3,x.id),m2),m),0);
+    moved.id=maxSid+1;
+  }
+  to.subjects=(to.subjects||[]).concat([moved]);
+  return data;
+}
+
+/** Release the calendar events of tasks that are about to be removed.
+ *
+ *  Task ids are minted per subject as max+1, so deleting the highest task
+ *  frees its id for the next one — and the calendar uid is built from that id.
+ *  Without this, a brand-new unrelated task inherited the deleted task's
+ *  event, title and all: the backend finds it by osm_uid and patches it.
+ *
+ *  The event itself is deliberately left in the calendar. It may carry notes,
+ *  guests or a time the user set by hand, and deleting a task in a planner is
+ *  not consent to delete a calendar entry. Unlinking only clears the stamp
+ *  that made it claimable, so the event becomes an ordinary one.
+ *
+ *  Must be called BEFORE the tasks are removed: gcalSyncTask reads the task
+ *  synchronously to build its payload. Fire-and-forget, like every other
+ *  sync path. */
+function gcalReleaseTasks(phaseKey,tid,sid,tasks){
+  if(!gcalSyncEnabled()) return;
+  (tasks||[]).forEach(t=>{
+    if(t&&t.gcal&&t.gcal.eventId) gcalSyncTask(phaseKey,tid,sid,t.id,'unlink');
+  });
+}
+
+/** Called by the subject row's "Move to..." picker. */
+function transferSubjectTo(tid,sid,toTid){
+  const target=Number(toTid);
+  if(!target||target===tid) return;
+  const topic=phases[currentPhase].topics.find(x=>x.id===tid);
+  if(topic&&topic.subjects.length<=1){alert('A topic must have at least one subject.');return;}
+  phases=transferSubject(phases,currentPhase,tid,sid,target);
+  _histSetLabel('Move subject');
+  closePopover();
+  saveData();renderTable();}
+
 function moveSubject(phasesData,phaseKey,topicId,fromIdx,toIdx,after){
   const data=JSON.parse(JSON.stringify(phasesData));
   const ph=data[phaseKey];if(!ph) return data;
@@ -2593,7 +2850,7 @@ function renderWizard(){
 function _wizStep1(c){
   const ph=phases[wizardState.fromKey];
   const title=document.createElement('div');
-  title.innerHTML=`<div style="font-size:13px;font-weight:500;margin-bottom:4px">Conclude ${ph.label}</div>`+
+  title.innerHTML=`<div style="font-size:13px;font-weight:500;margin-bottom:4px">Conclude ${esc(ph.label)}</div>`+
     `<div style="font-size:12px;color:#888;margin-bottom:12px">Name the next phase and set its period.</div>`;
   c.appendChild(title);
 
@@ -2645,8 +2902,8 @@ function _wizStep2(c){
     const lbl=document.createElement('label');
     lbl.style.cssText='display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:6px;cursor:pointer;border:0.5px solid #eee';
     lbl.innerHTML=`<input type="checkbox" data-tid="${topic.id}"${checked?' checked':''}>`+
-      `<div style="width:8px;height:8px;border-radius:50%;background:${topic.color};flex-shrink:0"></div>`+
-      `<span style="font-size:12px;flex:1">${topic.name}${topic.archived?' <span style="font-size:10px;color:#aaa">(archived)</span>':''}</span>`+
+      `<div style="width:8px;height:8px;border-radius:50%;background:${esc(topic.color)};flex-shrink:0"></div>`+
+      `<span style="font-size:12px;flex:1">${esc(topic.name)}${topic.archived?' <span style="font-size:10px;color:#aaa">(archived)</span>':''}</span>`+
       `<span style="font-size:11px;color:#aaa">${unresolved} unresolved</span>`;
     lbl.querySelector('input').onchange=e=>{
       wizardState.selectedTids=e.target.checked
@@ -2664,7 +2921,7 @@ function _wizStep3(c){
   const sel=ph.topics.filter(t=>wizardState.selectedTids.includes(t.id));
   const title=document.createElement('div');
   title.innerHTML=`<div style="font-size:13px;font-weight:500;margin-bottom:4px">Review</div>`+
-    `<div style="font-size:12px;color:#888;margin-bottom:12px">Confirm to conclude ${ph.label} and create the new phase.</div>`;
+    `<div style="font-size:12px;color:#888;margin-bottom:12px">Confirm to conclude ${esc(ph.label)} and create the new phase.</div>`;
   c.appendChild(title);
 
   const phBox=document.createElement('div');
@@ -2689,8 +2946,8 @@ function _wizStep3(c){
       const n=topic.subjects.flatMap(s=>s.tasks).filter(t=>!t.done).length;
       const row=document.createElement('div');
       row.style.cssText='display:flex;align-items:center;gap:7px;padding:4px 0;border-bottom:0.5px solid #f5f5f5';
-      row.innerHTML=`<div style="width:7px;height:7px;border-radius:50%;background:${topic.color};flex-shrink:0"></div>`+
-        `<span style="font-size:12px;flex:1">${topic.name}</span>`+
+      row.innerHTML=`<div style="width:7px;height:7px;border-radius:50%;background:${esc(topic.color)};flex-shrink:0"></div>`+
+        `<span style="font-size:12px;flex:1">${esc(topic.name)}</span>`+
         `<span style="font-size:11px;color:#aaa">${n} task${n!==1?'s':''}</span>`;
       topBox.appendChild(row);
     });
@@ -2753,7 +3010,6 @@ function executeWizard(){
   saveData();
   renderTabs();
   renderTable();
-  renderColNumbers();
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2940,181 +3196,42 @@ window.addEventListener('scroll',saveScrollPos,{passive:true});
   const ind=document.getElementById('save-indicator');
   if(ind){ind.textContent='Loading...';ind.style.opacity='1';}
   const remote=await loadFromSupabase();
-  if(remote){
-    phases=remote;
-    try{localStorage.setItem(LS_KEY,JSON.stringify(phases));}catch(e){}
+  let dirty=false;
+  try{dirty=localStorage.getItem(LS_DIRTY_KEY)==='1';}catch(e){}
+  if(remote&&!dirty&&remoteIsNewer(remote.updatedAt)){
+    phases=remote.phases;
+    ensureCurrentPhase();
+    try{
+      localStorage.setItem(LS_KEY,JSON.stringify(phases));
+      if(remote.updatedAt) localStorage.setItem(LS_SYNCED_KEY,remote.updatedAt);
+    }catch(e){}
     if(ind) ind.textContent='Synced';
+  } else if(remote){
+    // Local is ahead of the row: an edit made offline, or inside the save
+    // debounce before the tab closed. Keep it and push it up.
+    if(ind) ind.textContent='Local ahead';
+    saveData();
   } else {
     if(ind) ind.textContent='Local';
   }
   if(ind){clearTimeout(ind._t);ind._t=setTimeout(()=>{ind.style.opacity='0';},1500);}
-  const savedPhase=localStorage.getItem(LS_PHASE_KEY);
+  let savedPhase=null;
+  try{savedPhase=localStorage.getItem(LS_PHASE_KEY);}catch(e){}
   if(savedPhase&&phases[savedPhase]) currentPhase=savedPhase;
+  // Covers the local-only paths too: currentPhase still holds its 'PH4'
+  // literal default, and PH4 may have been deleted.
+  ensureCurrentPhase();
   // If the user edited during the ~2s remote-load window, keep their undo
   // history and only re-anchor the Revert baseline.
   if(_histPast.length===0) _histInit(); else _histRebase();
   renderTabs();
   renderTable();
-  renderColNumbers();
   requestAnimationFrame(()=>requestAnimationFrame(restoreScrollPos));
   // Retry completions stranded by an earlier failure. Not awaited: a dead
   // backend must not hold up first paint.
   if(gcalSyncEnabled()) gcalFlushQueue();
 })();
 </script>
-<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-<script>
-function importXlsx(input){
-  const file=input.files[0];
-  if(!file) return;
-  const reader=new FileReader();
-  reader.onload=function(e){
-    try{
-      const wb=XLSX.read(e.target.result,{type:'array'});
-      const phaseMap={'Projects PH2':'PH2','Projects PH3':'PH3','Projects PH4':'PH4'};
-      let imported=0;
 
-      wb.SheetNames.forEach(sheetName=>{
-        const phKey=phaseMap[sheetName];
-        if(!phKey) return;
-        const rows=XLSX.utils.sheet_to_json(wb.Sheets[sheetName],{header:1,defval:''});
-        if(!rows||rows.length<2) return;
-
-        const parsed=parseSheet(rows);
-        if(!phases[phKey]) phases[phKey]={label:sheetName,topics:[]};
-        mergePhase(phases[phKey],parsed);
-        imported++;
-      });
-
-      if(imported===0){alert('No matching sheets found. Make sure your sheets are named: Projects PH2, Projects PH3, Projects PH4');return;}
-      _histSetLabel('Import Excel');
-      saveData();
-      renderTabs();
-      renderTable();
-      const toast=document.getElementById('export-toast');
-      toast.textContent='Imported!';
-      toast.style.opacity='1';
-      clearTimeout(toast._t);
-      toast._t=setTimeout(()=>{toast.style.opacity='0';toast.textContent='Downloaded!';},2500);
-    }catch(err){
-      alert('Import error: '+err.message);
-      console.error(err);
-    }
-    input.value='';
-  };
-  reader.readAsArrayBuffer(file);
-}
-
-function parseSheet(rows){
-  const topics=[];
-  let currentTopic=null;
-  let topicId=1000;
-  let subjectId=1000;
-
-  for(let i=1;i<Math.min(rows.length,74);i++){
-    const row=rows[i];
-    const col0=String(row[0]||'').trim();
-    const col1=String(row[1]||'').trim();
-
-    if(!col0&&!col1) continue;
-
-    if(col0&&col0!=='->'&&!col0.startsWith('->')){
-      currentTopic={id:topicId++,name:col0,color:COLORS[topics.length%COLORS.length],subjects:[]};
-      topics.push(currentTopic);
-    }
-
-    if(col1&&currentTopic){
-      const tasks=[];
-      for(let c=2;c<row.length;c++){
-        const raw=row[c];
-        if(raw===undefined||raw===null) continue;
-        const cell=String(raw).trim();
-        if(!cell||cell==='undefined') continue;
-        const text=cell.startsWith('-')?cell.replace(/^-\s*/,'').trim():cell;
-        if(text) tasks.push(text);
-      }
-      currentTopic.subjects.push({id:subjectId++,name:col1,goal:'',tasks});
-    }
-  }
-  return topics;
-}
-
-function mergePhase(phase, newTopics){
-  newTopics.forEach(newTopic=>{
-    const existing=phase.topics.find(t=>t.name.toLowerCase()===newTopic.name.toLowerCase());
-    if(!existing){
-      phase.topics.push({
-        id:newTopic.id,name:newTopic.name,color:newTopic.color,
-        subjects:newTopic.subjects.map(sub=>({
-          id:sub.id,name:sub.name,goal:sub.goal,
-          tasks:sub.tasks.map((t,i)=>({id:i+1,text:t,done:false,priority:undefined}))
-        }))
-      });
-    } else {
-      newTopic.subjects.forEach(newSub=>{
-        const exSub=existing.subjects.find(s=>s.name.toLowerCase()===newSub.name.toLowerCase());
-        if(!exSub){
-          existing.subjects.push({
-            id:newSub.id,name:newSub.name,goal:newSub.goal,
-            tasks:newSub.tasks.map((t,i)=>({id:i+1,text:t,done:false,priority:undefined}))
-          });
-        } else {
-          exSub.tasks=exSub.tasks.filter(t=>t.text&&t.text!=='undefined');
-          newSub.tasks.forEach(taskText=>{
-            if(!taskText||taskText==='undefined') return;
-            const exTask=exSub.tasks.find(t=>t.text.toLowerCase()===taskText.toLowerCase());
-            if(!exTask){
-              const maxId=exSub.tasks.reduce((a,t)=>Math.max(a,t.id),0);
-              exSub.tasks.push({id:maxId+1,text:taskText,done:false,priority:undefined});
-            }
-          });
-        }
-      });
-    }
-  });
-}
-
-function syncFromGSheets(){
-  const url='https://docs.google.com/spreadsheets/d/1UpnrOrUUnNAUhWhkDFJhNJFmfR2985p7XrIO7VqE72g/export?format=xlsx';
-  const toast=document.getElementById('export-toast');
-  toast.textContent='Syncing...';
-  toast.style.opacity='1';
-
-  fetch(url)
-    .then(r=>{
-      if(!r.ok) throw new Error('Could not fetch sheet. Make sure it is publicly shared.');
-      return r.arrayBuffer();
-    })
-    .then(buf=>{
-      const wb=XLSX.read(buf,{type:'array'});
-      const phaseMap={'Projects PH2':'PH2','Projects PH3':'PH3','Projects PH4':'PH4'};
-      let imported=0;
-      wb.SheetNames.forEach(sheetName=>{
-        const phKey=phaseMap[sheetName];
-        if(!phKey) return;
-        const rows=XLSX.utils.sheet_to_json(wb.Sheets[sheetName],{header:1,defval:''});
-        if(!rows||rows.length<2) return;
-        const parsed=parseSheet(rows);
-        const label=phases[phKey]?phases[phKey].label:sheetName;
-        phases[phKey]={label,topics:[]};
-        mergePhase(phases[phKey],parsed);
-        imported++;
-      });
-      if(imported===0) throw new Error('No matching sheets found (Projects PH2/3/4/5).');
-      _histSetLabel('Sync Google Sheet');
-      saveData();
-      renderTabs();
-      renderTable();
-      toast.textContent='Synced!';
-      clearTimeout(toast._t);
-      toast._t=setTimeout(()=>{toast.style.opacity='0';toast.textContent='Downloaded!';},2500);
-    })
-    .catch(err=>{
-      toast.style.opacity='0';
-      alert('Sync failed: '+err.message);
-      console.error(err);
-    });
-}
-</script>
 </body>
 </html>
