@@ -1763,6 +1763,14 @@ function gcalContext(phaseLabel,topicName,subjectName){
   return [phaseLabel,topicName,subjectName].filter(Boolean).join(' > ');
 }
 
+/** Pure — the event title: "Topic: task text", matching how the events are
+ *  named by hand in Calendar. A task with no topic keeps its bare text. */
+function gcalEventTitle(topicName,taskText){
+  const t=topicName==null?'':String(topicName).trim();
+  const x=taskText==null?'':String(taskText);
+  return t?t+': '+x:x;
+}
+
 /** Pure — Google Calendar prefilled-event URL for a single all-day task. */
 function gcalTemplateUrl(text,details,date){
   const start=date||new Date();
@@ -1782,7 +1790,7 @@ function addTaskToGCal(tid,sid,taskId){
   const sub=topic&&topic.subjects.find(x=>x.id===sid);
   const t=sub&&sub.tasks.find(x=>x.id===taskId);
   if(!t) return;
-  const url=gcalTemplateUrl(t.text,gcalContext(ph.label,topic.name,sub.name));
+  const url=gcalTemplateUrl(gcalEventTitle(topic.name,t.text),gcalContext(ph.label,topic.name,sub.name));
   window.open(url,'_blank','noopener');
 }
 
@@ -1805,7 +1813,7 @@ function collectNowTasks(phasesData){
     (ph.topics||[]).forEach(topic=>{
       (topic.subjects||[]).forEach(sub=>{
         (sub.tasks||[]).filter(t=>t.priority==='urgent'&&!t.done).forEach(t=>{
-          out.push({phaseKey,phase:ph.label,topic:topic.name,topicId:topic.id,subject:sub.name,subjectId:sub.id,taskId:t.id,text:t.text});
+          out.push({phaseKey,phase:ph.label,topic:topic.name,topicId:topic.id,subject:sub.name,subjectId:sub.id,taskId:t.id,text:gcalEventTitle(topic.name,t.text)});
         });
       });
     });
@@ -1869,14 +1877,6 @@ const GCAL_QUEUE_LIMIT   = 50;
  *  and an API-synced event land on the same event instead of duplicating it. */
 function gcalTaskUid(phaseKey,topicId,subjectId,taskId){
   return [phaseKey,topicId,subjectId,taskId].join('-');
-}
-
-/** Pure — the event title: "Topic: task text", matching how the events are
- *  named by hand in Calendar. A task with no topic keeps its bare text. */
-function gcalEventTitle(topicName,taskText){
-  const t=topicName==null?'':String(topicName).trim();
-  const x=taskText==null?'':String(taskText);
-  return t?t+': '+x:x;
 }
 
 /** Pure — the single kill switch both call-sites are guarded by. */
