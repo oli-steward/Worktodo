@@ -1780,7 +1780,15 @@ function toggleTask(tid,sid,taskId){
   if(tk) tk.done=!tk.done;
   // Fire-and-forget: the calendar round trip must never delay the local save
   // or the re-render, and it persists itself (see gcalSyncTask).
-  if(tk&&gcalSyncEnabled()) gcalSyncTask(currentPhase,tid,sid,taskId,tk.done?'complete':'reopen');
+  //
+  // Unticking a task whose event this app minted on the previous tick throws
+  // that event away rather than reopening it, so a mis-click leaves no trace
+  // in the calendar. An event you created deliberately with Cal is only
+  // reopened, never discarded.
+  if(tk&&gcalSyncEnabled()){
+    const op=tk.done?'complete':((tk.gcal&&tk.gcal.auto)?'discard':'reopen');
+    gcalSyncTask(currentPhase,tid,sid,taskId,op);
+  }
   saveData();
   renderTable();
 }
@@ -1984,16 +1992,26 @@ function gcalBuildPayload(op,ctx){
 /** Pure — folds a response into the task's link record. NOT_FOUND means the
  *  event was deleted in Calendar, so the link is dropped rather than kept:
  *  the next sync then re-creates the event instead of patching a ghost. */
-function gcalApplyResult(task,result){
+function gcalApplyResult(task,result,op){
   if(!task) return task;
   const r=result||{};
+  if(r.ok&&(op==='unlink'||op==='delete')){
+    task.gcal=null;                      // the task no longer owns an event
+    return task;
+  }
   if(r.ok){
+    // `auto` marks an event this app created by itself, as the side effect of
+    // ticking a task that had none. Only those are thrown away again when the
+    // tick is undone; an event you asked for with Cal is yours to keep.
+    const wasAuto=task.gcal&&task.gcal.auto;
+    const minted=!task.gcal&&op==='complete';
     task.gcal={
       eventId:r.eventId,
       calendarId:r.calendarId||GCAL_SYNC_CALENDAR,
       syncedAt:r.syncedAt||new Date().toISOString(),
       status:r.status||'open'
     };
+    if(wasAuto||minted) task.gcal.auto=true;
   }else if(r.code==='NOT_FOUND'){
     task.gcal=null;
   }
@@ -2111,13 +2129,25 @@ async function gcalSyncTask(phaseKey,tid,sid,taskId,op){
     if(_gcalInFlight.has(uid)){_gcalPendingOp.set(uid,op);return;}
     _gcalInFlight.add(uid);
     owned=true;
-    const payload=gcalBuildPayload(op,{
+    // 'discard' is not a wire op. It means "remove the event if the backend
+    // can, otherwise at least stop claiming it" — so it goes out as 'delete'
+    // and falls back to 'unlink' when Code.gs does not know that verb.
+    const wireOp=op==='discard'?'delete':op;
+    const payload=gcalBuildPayload(wireOp,{
       uid:uid,
       text:gcalEventTitle(topic.name,tk.text),
       context:gcalContext(ph.label,topic.name,sub.name),
       link:tk.gcal
     });
-    const result=await gcalPost(payload);
+    let result=await gcalPost(payload);
+    let effectiveOp=wireOp;
+    if(op==='discard'&&result&&!result.ok&&result.code==='BAD_REQUEST'){
+      // An older Code.gs rejects an unknown op. Unlink instead: the event stays
+      // in the calendar, but the task stops owning it and the tag goes.
+      payload.op='unlink';payload.ts=Date.now();
+      result=await gcalPost(payload);
+      effectiveOp='unlink';
+    }
     const code=result&&result.ok?null:((result&&result.code)||'CALENDAR_ERROR');
     // Re-resolve after the await. `tk` was found before it, and undo, moveTask,
     // transferSubject, archive and a phase transition all replace `phases`
@@ -2126,7 +2156,7 @@ async function gcalSyncTask(phaseKey,tid,sid,taskId,op){
     const live=gcalTaskFromUid(phases,uid);
     if(live){
       const before=gcalLinkSig(live);
-      gcalApplyResult(live,result);
+      gcalApplyResult(live,result,effectiveOp);
       // Only a success or a NOT_FOUND changes task.gcal; nothing else is worth a write.
       if((!code||code==='NOT_FOUND')&&gcalLinkSig(live)!==before){
         // Persist remotely too. localStorage alone meant the link was erased by
