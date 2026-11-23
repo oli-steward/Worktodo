@@ -2111,6 +2111,7 @@ async function gcalPost(payload){
 async function gcalSyncTask(phaseKey,tid,sid,taskId,op){
   if(!gcalSyncEnabled()) return;
   const uid=gcalTaskUid(phaseKey,tid,sid,taskId);
+  const live0=()=>gcalTaskFromUid(phases,uid);
   let owned=false;
   try{
     const ph=phases&&phases[phaseKey];
@@ -2141,12 +2142,27 @@ async function gcalSyncTask(phaseKey,tid,sid,taskId,op){
     });
     let result=await gcalPost(payload);
     let effectiveOp=wireOp;
-    if(op==='discard'&&result&&!result.ok&&result.code==='BAD_REQUEST'){
-      // An older Code.gs rejects an unknown op. Unlink instead: the event stays
+    if(op==='discard'&&!(result&&result.ok)){
+      // ANY failure, not just BAD_REQUEST. A Code.gs that does not know
+      // 'delete' may reject it with any code, or throw and surface as a
+      // network error — and assuming one shape left the task tagged and a
+      // dead 'delete' retrying on every load. Unlink instead: the event stays
       // in the calendar, but the task stops owning it and the tag goes.
       payload.op='unlink';payload.ts=Date.now();
       result=await gcalPost(payload);
       effectiveOp='unlink';
+      if(!(result&&result.ok)){
+        // Neither verb got through. Drop the link locally anyway — keeping it
+        // would leave a tag claiming an event the user asked to be rid of —
+        // and queue the unlink, which still carries the event id.
+        if(live0()) gcalApplyResult(live0(),{ok:true},'unlink');
+        saveDataQuiet();
+        try{renderTable();}catch(e){}
+        if(gcalIsRetryable((result&&result.code)||'CALENDAR_ERROR')){
+          _gcalQueueWrite(gcalQueuePush(_gcalQueueRead(),payload,GCAL_QUEUE_LIMIT));
+        }
+        return;
+      }
     }
     const code=result&&result.ok?null:((result&&result.code)||'CALENDAR_ERROR');
     // Re-resolve after the await. `tk` was found before it, and undo, moveTask,
