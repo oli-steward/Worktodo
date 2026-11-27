@@ -1867,10 +1867,28 @@ function addTaskToGCal(tid,sid,taskId){
   const t=sub&&sub.tasks.find(x=>x.id===taskId);
   if(!t) return;
   if(gcalSyncEnabled()){
-    // Through the backend the app learns the event id, so the task gets a real
-    // link and a "cal" chip tag. The template URL below cannot: Google saves the
-    // event in its own editor and tells this page nothing.
-    gcalSyncTask(currentPhase,tid,sid,taskId,t.done?'complete':'upsert');
+    // Create it through the backend, so the app learns the event id and the
+    // task gets a real link and a "cal" tag — the template URL cannot do that,
+    // because Google saves the event in its own editor and tells this page
+    // nothing — and THEN open the created event so the time and details can
+    // still be edited by hand. Both halves, instead of trading one away.
+    //
+    // The tab must be opened here, synchronously on the click, or Chrome
+    // treats it as an unrequested popup and blocks it. 'noopener' is left off
+    // deliberately: it makes window.open return null, and the handle is needed
+    // to steer the tab once the reply arrives. opener is cleared instead.
+    let win=null;
+    try{
+      win=window.open('','_blank');
+      if(win&&win.document) win.document.write('Opening Google Calendar\u2026');
+    }catch(e){}
+    gcalSyncTask(currentPhase,tid,sid,taskId,t.done?'complete':'upsert',r=>{
+      if(!win) return;                       // popup blocked — the event still exists
+      try{
+        if(r&&r.ok&&r.htmlLink){win.opener=null;win.location=r.htmlLink;}
+        else win.close();                    // nothing was created; do not strand a blank tab
+      }catch(e){}
+    });
     return;
   }
   const url=gcalTemplateUrl(gcalEventTitle(topic.name,t.text),gcalContext(ph.label,topic.name,sub.name));
@@ -2108,7 +2126,7 @@ async function gcalPost(payload){
  *  never saveData(): resolving asynchronously, saveData() would push a stale
  *  phases snapshot to Supabase and add a non-user entry to the undo history.
  *  The next real user action carries the link onward. Never throws. */
-async function gcalSyncTask(phaseKey,tid,sid,taskId,op){
+async function gcalSyncTask(phaseKey,tid,sid,taskId,op,onResult){
   if(!gcalSyncEnabled()) return;
   const uid=gcalTaskUid(phaseKey,tid,sid,taskId);
   const live0=()=>gcalTaskFromUid(phases,uid);
@@ -2165,6 +2183,9 @@ async function gcalSyncTask(phaseKey,tid,sid,taskId,op){
       }
     }
     const code=result&&result.ok?null:((result&&result.code)||'CALENDAR_ERROR');
+    // Hand the raw reply to the caller before anything else: addTaskToGCal
+    // needs the event's htmlLink to steer the tab it opened on the click.
+    if(onResult){try{onResult(result);}catch(e){}}
     // Re-resolve after the await. `tk` was found before it, and undo, moveTask,
     // transferSubject, archive and a phase transition all replace `phases`
     // wholesale — applying the result to the old object left the event orphaned
