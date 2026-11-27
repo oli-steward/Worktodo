@@ -1880,15 +1880,26 @@ function addTaskToGCal(tid,sid,taskId){
     let win=null;
     try{
       win=window.open('','_blank');
-      if(win&&win.document) win.document.write('Opening Google Calendar\u2026');
+      if(win&&win.document){
+        win.document.write('<title>Opening Google Calendar…</title>Opening Google Calendar…');
+        win.document.close();   // without this the tab spins as "loading" forever
+      }
     }catch(e){}
+    // The tab must never be left stranded. It is settled by whichever comes
+    // first: the reply, or this deadline. A second click while the first
+    // request is still out gets no reply of its own — the sync defers it — so
+    // the deadline is the only thing that would ever close that tab.
+    let settled=false;
+    const settle=(url)=>{
+      if(settled||!win) return;
+      settled=true;
+      try{ if(url){win.opener=null;win.location=url;} else win.close(); }catch(e){}
+    };
+    const deadline=setTimeout(()=>settle(null),15000);
     gcalSyncTask(currentPhase,tid,sid,taskId,t.done?'complete':'upsert',r=>{
-      if(!win) return;                       // popup blocked — the event still exists
-      try{
-        if(r&&r.ok&&r.htmlLink){win.opener=null;win.location=r.htmlLink;}
-        else win.close();                    // nothing was created; do not strand a blank tab
-      }catch(e){}
-    });
+      clearTimeout(deadline);
+      settle(r&&r.ok&&r.htmlLink?r.htmlLink:null);
+    },'cal');
     return;
   }
   const url=gcalTemplateUrl(gcalEventTitle(topic.name,t.text),gcalContext(ph.label,topic.name,sub.name));
@@ -2003,6 +2014,11 @@ function gcalBuildPayload(op,ctx){
   const task={uid:c.uid,text:c.text,context:c.context};
   if(c.date) task.date=c.date;
   const payload={v:1,token:GCAL_SYNC_TOKEN,ts:Date.now(),op:op,task:task};
+  // Who asked for this: 'tick' (a side effect of completing a task) or 'cal'
+  // (you pressed the button). The backend ignores it; the client needs it to
+  // decide whether an event it creates may later be thrown away, and it must
+  // survive a trip through the offline queue, which is why it rides here.
+  if(c.src) payload.src=c.src;
   if(c.link&&c.link.eventId) payload.link={eventId:c.link.eventId,calendarId:c.link.calendarId||GCAL_SYNC_CALENDAR};
   return payload;
 }
@@ -2010,7 +2026,7 @@ function gcalBuildPayload(op,ctx){
 /** Pure — folds a response into the task's link record. NOT_FOUND means the
  *  event was deleted in Calendar, so the link is dropped rather than kept:
  *  the next sync then re-creates the event instead of patching a ghost. */
-function gcalApplyResult(task,result,op){
+function gcalApplyResult(task,result,op,src){
   if(!task) return task;
   const r=result||{};
   if(r.ok&&(op==='unlink'||op==='delete')){
@@ -2021,8 +2037,12 @@ function gcalApplyResult(task,result,op){
     // `auto` marks an event this app created by itself, as the side effect of
     // ticking a task that had none. Only those are thrown away again when the
     // tick is undone; an event you asked for with Cal is yours to keep.
+    //
+    // Intent is passed in, never inferred from the op: pressing Cal on a task
+    // that is already done also sends 'complete', and inferring from that
+    // flagged a deliberate event as auto — so the next untick deleted it.
     const wasAuto=task.gcal&&task.gcal.auto;
-    const minted=!task.gcal&&op==='complete';
+    const minted=!task.gcal&&src==='tick';
     task.gcal={
       eventId:r.eventId,
       calendarId:r.calendarId||GCAL_SYNC_CALENDAR,
@@ -2126,7 +2146,7 @@ async function gcalPost(payload){
  *  never saveData(): resolving asynchronously, saveData() would push a stale
  *  phases snapshot to Supabase and add a non-user entry to the undo history.
  *  The next real user action carries the link onward. Never throws. */
-async function gcalSyncTask(phaseKey,tid,sid,taskId,op,onResult){
+async function gcalSyncTask(phaseKey,tid,sid,taskId,op,onResult,src){
   if(!gcalSyncEnabled()) return;
   const uid=gcalTaskUid(phaseKey,tid,sid,taskId);
   const live0=()=>gcalTaskFromUid(phases,uid);
@@ -2145,7 +2165,13 @@ async function gcalSyncTask(phaseKey,tid,sid,taskId,op,onResult){
     // The later op is REMEMBERED, not dropped: simply returning meant ticking
     // and immediately unticking sent only the complete, leaving the task open
     // and its event concluded for good.
-    if(_gcalInFlight.has(uid)){_gcalPendingOp.set(uid,op);return;}
+    if(_gcalInFlight.has(uid)){
+      _gcalPendingOp.set(uid,op);
+      // This call makes no request of its own, so it will never produce a
+      // reply. Tell the caller now, or anything waiting on one waits forever.
+      if(onResult){try{onResult(null);}catch(e){}}
+      return;
+    }
     _gcalInFlight.add(uid);
     owned=true;
     // 'discard' is not a wire op. It means "remove the event if the backend
@@ -2156,7 +2182,8 @@ async function gcalSyncTask(phaseKey,tid,sid,taskId,op,onResult){
       uid:uid,
       text:gcalEventTitle(topic.name,tk.text),
       context:gcalContext(ph.label,topic.name,sub.name),
-      link:tk.gcal
+      link:tk.gcal,
+      src:src||'tick'
     });
     let result=await gcalPost(payload);
     let effectiveOp=wireOp;
@@ -2193,7 +2220,7 @@ async function gcalSyncTask(phaseKey,tid,sid,taskId,op,onResult){
     const live=gcalTaskFromUid(phases,uid);
     if(live){
       const before=gcalLinkSig(live);
-      gcalApplyResult(live,result,effectiveOp);
+      gcalApplyResult(live,result,effectiveOp,payload.src);
       // Only a success or a NOT_FOUND changes task.gcal; nothing else is worth a write.
       if((!code||code==='NOT_FOUND')&&gcalLinkSig(live)!==before){
         // Persist remotely too. localStorage alone meant the link was erased by
@@ -2218,7 +2245,7 @@ async function gcalSyncTask(phaseKey,tid,sid,taskId,op,onResult){
       const next=_gcalPendingOp.get(uid);
       if(next!==undefined){
         _gcalPendingOp.delete(uid);
-        gcalSyncTask(phaseKey,tid,sid,taskId,next);
+        gcalSyncTask(phaseKey,tid,sid,taskId,next,null,src);
       }
     }
   }
@@ -2251,7 +2278,7 @@ async function gcalFlushQueue(){
         // Re-resolve: the tree may have been replaced during the await.
         const tk=gcalTaskFromUid(phases,uid)||target;
         const before=gcalLinkSig(tk);
-        gcalApplyResult(tk,result);
+        gcalApplyResult(tk,result,p.op,p.src);
         if(gcalLinkSig(tk)!==before) linked=true;
         continue;
       }
